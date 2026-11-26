@@ -38,7 +38,9 @@ struct QKNormRopeParams { int32_t M, n_heads, n_kv_heads, head_dim, rope_dim, po
 struct GQA256Params     { int32_t M, n_heads, n_kv_heads, pos, max_seq; };
 struct TopKParams       { int32_t M, E, top_k; };
 struct MoEProjParams    { int32_t M, K, N, top_k, gs_shift; uint64_t stride_w, stride_s; };
-struct SparseRepParams  { int32_t M, K_len, n_slots; float penalty; int32_t slots[64]; };
+// Repetition penalty PER BARIS (lihat build_rep_rows). setBytes ≤ 4 KB: 8 baris × 65 int = 2.1 KB.
+constexpr int REP_WIN = 64, REP_STRIDE = REP_WIN + 1;
+struct RepRowsParams    { int32_t M, K_len, stride; float penalty; int32_t rows[8 * REP_STRIDE]; };
 struct DeltaNetInParams { int32_t M, K, gs_shift, n_qkv, n_z, n_a, n_b; };
 struct FullQKVParams    { int32_t M, K, gs_shift, n_q, n_k, n_v; };
 
@@ -150,6 +152,26 @@ struct FastSuffixSpeculator {
         if (n >= 4) add(idx4, h4(toks[n-4], toks[n-3], toks[n-2], toks[n-1]), n);
     }
 
+    // Orde n-gram tertinggi yang punya kecocokan valid (= orde yang dipakai propose); 0 = tidak ada.
+    int match_order() const {
+        const int n = int(toks.size());
+        auto has = [&](const std::unordered_map<uint64_t, std::vector<int32_t>>& mp, uint64_t k, int order) {
+            auto it = mp.find(k);
+            if (it == mp.end()) return false;
+            for (int pos : it->second) {
+                if (pos >= n) continue;
+                bool ok = true;
+                for (int j = 0; j < order; ++j) if (toks[pos - order + j] != toks[n - order + j]) { ok = false; break; }
+                if (ok) return true;
+            }
+            return false;
+        };
+        if (n >= 4 && has(idx4, h4(toks[n-4], toks[n-3], toks[n-2], toks[n-1]), 4)) return 4;
+        if (n >= 3 && has(idx3, h3(toks[n-3], toks[n-2], toks[n-1]), 3)) return 3;
+        if (n >= 2 && has(idx2, h2(toks[n-2], toks[n-1]), 2)) return 2;
+        return 0;
+    }
+
     std::vector<int32_t> propose(int max_len) const {
         std::vector<int32_t> out;
         int n = int(toks.size());
@@ -194,23 +216,67 @@ static id<MTLComputePipelineState> make_pso(
     return pso;
 }
 
-static SparseRepParams build_rep(const std::vector<int32_t>& gen, int M, int vocab, float pen) {
-    SparseRepParams rp{};
-    rp.M = M; rp.K_len = vocab; rp.penalty = pen; rp.n_slots = 0;
-    if (pen <= 1.001f || gen.empty()) return rp;
-    int start = std::max(0, int(gen.size()) - 64);
-    for (int i = start; i < int(gen.size()); ++i) {
-        int32_t t = gen[i];
-        if (t < 0 || t >= vocab) continue;
-        bool dup = false;
-        for (int j = 0; j < rp.n_slots; ++j) if (rp.slots[j] == t) { dup = true; break; }
-        if (!dup && rp.n_slots < 64) rp.slots[rp.n_slots++] = t;
+// Baris m memverifikasi token SETELAH (riwayat + draft 1..m). Himpunan penalty-nya = REP_WIN token
+// terakhir dari (hist ++ batch[1..m]), unik. Dengan himpunan yang SAMA untuk semua baris (versi lama),
+// spekulasi + penalty ≠ decode berurutan + penalty. penalty = 1 → tidak aktif.
+static RepRowsParams build_rep_rows(const std::vector<int32_t>& hist, const int32_t* batch, int M, int vocab, float pen) {
+    RepRowsParams rp{};
+    rp.M = M; rp.K_len = vocab; rp.stride = REP_STRIDE; rp.penalty = pen;
+    if (!(pen > 0.0f && (pen > 1.0001f || pen < 0.9999f))) return rp;
+    for (int m = 0; m < M; ++m) {
+        int32_t* row = rp.rows + m * REP_STRIDE;
+        const int total = int(hist.size()) + m;
+        int n = 0;
+        for (int i = std::max(0, total - REP_WIN); i < total; ++i) {
+            const int32_t t = (i < int(hist.size())) ? hist[size_t(i)] : batch[1 + i - int(hist.size())];
+            if (t < 0 || t >= vocab) continue;
+            bool dup = false;
+            for (int j = 0; j < n; ++j) if (row[1 + j] == t) { dup = true; break; }
+            if (!dup) row[1 + n++] = t;
+        }
+        row[0] = n;
     }
     return rp;
 }
+static inline bool rep_active(const RepRowsParams& rp) { return rp.penalty > 0.0f && (rp.penalty > 1.0001f || rp.penalty < 0.9999f); }
+
+// Peluang draft diterima per token, PER ORDE n-gram, sebagai proses geometrik:
+//   α = token diterima / (token diterima + penolakan).
+// Estimator lama (EMA dari acc/(M−1)) mencatat 5/7 sebagai 0.71 padahal draft ke-6 yang ditolak berarti
+// peluang per token ≈ 5/6, dan satu penolakan langsung memangkas k. Di hardcore-on-mac perbaikan ini
+// menaikkan mode adaptif 609 → 780 tok/s (Qwen2.5 1.5B, edit).
+struct OrderAlpha {
+    double A[5] = {0, 0, 0, 0, 0}, R[5] = {0, 0, 0, 0, 0};
+    static double prior(int o) { return o <= 1 ? 0.4 : (o == 2 ? 0.6 : 0.85); }
+    double alpha(int o) const {
+        const double a = (A[o] + 4.0 * prior(o)) / (A[o] + R[o] + 4.0);
+        return std::min(0.995, std::max(0.05, a));
+    }
+    void update(int o, int acc, bool rejected) { A[o] = 0.9 * A[o] + acc; R[o] = 0.9 * R[o] + (rejected ? 1.0 : 0.0); }
+};
+
+static inline uint64_t fnv1a(uint64_t h, const void* data, size_t n) {
+    const uint8_t* p = (const uint8_t*)data;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Kernel mengasumsikan grup kuantisasi 32/64 dan K kelipatan 16 (3-bit: 32). Model di luar itu akan
+// menghasilkan teks rusak tanpa error, jadi tolak sejak load.
+static void check_qtensor(const char* name, int bits, int gs, int K, int N) {
+    const bool ok = (gs == 32 || gs == 64) && K > 0 && N > 0 && (K % gs) == 0 && (K % (bits == 3 ? 32 : 16)) == 0;
+    if (!ok) {
+        fprintf(stderr, "✗ Tensor %s tidak didukung (bits=%d gs=%d K=%d N=%d): butuh gs 32/64 dan K kelipatan 16\n",
+                name, bits, gs, K, N);
+        exit(1);
+    }
+}
 
 struct Qwen35Engine {
-    static constexpr int MAX_M = 8;
+    static constexpr int MAX_M = 8;     // batas verifikasi spekulatif (draft ≤ 7)
+    static constexpr int MAX_P = 32;    // batas chunk prefill (kernel MMA 4 tile)
+    int prefill_chunk = MAX_P;          // --prefill-chunk (1..32); 8 = perilaku lama
+    uint64_t model_fp = 0;              // sidik jari model untuk validasi .tstate
 
     std::vector<MappedFile> mapped_files;
     std::vector<id<MTLBuffer>> fallback_bufs;  // small tensors + any rare misaligned tensor fallback
@@ -235,6 +301,9 @@ struct Qwen35Engine {
     id<MTLCommandQueue> queue = nil;
 
     id<MTLComputePipelineState> pso_embed=nil, pso_rms=nil, pso_rep=nil, pso_argmax=nil, pso_topk64=nil;
+    id<MTLComputePipelineState> pso_qmm4_mmaP=nil, pso_qmm4_mmaP_add=nil, pso_qmm2_mmaP=nil, pso_qmm2_mmaP_add=nil;
+    id<MTLComputePipelineState> pso_sw4_mmaP=nil, pso_sw2_mmaP=nil, pso_dn_in4_mmaP=nil, pso_full_qkv4_mmaP=nil;
+    id<MTLComputePipelineState> pso_conv1d_prefill=nil, pso_dn_prefill=nil;
     id<MTLComputePipelineState> pso_qmv1[9], pso_qmv1_add[9];
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
     id<MTLComputePipelineState> pso_dn_in4=nil, pso_dn_in4_m1=nil, pso_dn_in4_mma8=nil;
@@ -254,7 +323,7 @@ struct Qwen35Engine {
     id<MTLBuffer> b_router_l=nil, b_sh_gl=nil, b_top_ids=nil, b_top_w=nil, b_sh_g=nil;
     id<MTLBuffer> b_uniq_cnt=nil, b_uniq_e=nil, b_grp_cnt=nil, b_grp_slots=nil;
     id<MTLBuffer> b_sh_h=nil, b_sh_out=nil, b_moe_h=nil, b_moe_out=nil, b_dense_h=nil;
-    id<MTLBuffer> b_logits=nil, b_out_tok=nil, b_top64_ids=nil, b_top64_vals=nil;
+    id<MTLBuffer> b_logits=nil, b_out_tok=nil, b_top64_ids=nil, b_top64_vals=nil, b_top64_flag=nil;
 
     std::vector<id<MTLBuffer>> conv_states, dn_states, k_caches, v_caches;
     std::vector<id<MTLBuffer>> conv_hist, dn_hist_k, dn_hist_d, dn_hist_dec;
@@ -304,6 +373,7 @@ struct Qwen35Engine {
 
         uint64_t meta_len = 0; memcpy(&meta_len, (uint8_t*)mf.mapped + 8, 8);
         NSData* metaData = [NSData dataWithBytesNoCopy:(uint8_t*)mf.mapped + 16 length:meta_len freeWhenDone:NO];
+        model_fp = fnv1a(1469598103934665603ULL, [metaData bytes], [metaData length]);
         NSError* jerr = nil;
         NSDictionary* meta = [NSJSONSerialization JSONObjectWithData:metaData options:0 error:&jerr];
         if (!meta) { fprintf(stderr, "JSON error: %s\n", [[jerr localizedDescription] UTF8String]); return false; }
@@ -354,6 +424,7 @@ struct Qwen35Engine {
             q.bits = [qm[0] intValue]; q.gs = [qm[1] intValue];
             q.N    = [qm[2] intValue]; q.K  = [qm[3] intValue];
             q.gs_shift = (q.gs == 32) ? 5 : 6;
+            check_qtensor(k.c_str(), q.bits, q.gs, q.K, q.N);
             if (is_switch) {
                 uint64_t kw = (q.bits == 4) ? uint64_t(q.K >> 3) :
                               (q.bits == 2) ? uint64_t(q.K >> 4) :
@@ -409,6 +480,8 @@ struct Qwen35Engine {
         };
 
         NSDictionary* cfg = read_json("config.json");
+        if (NSData* cfg_raw = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:(dir_path + "/config.json").c_str()]])
+            model_fp = fnv1a(1469598103934665603ULL, [cfg_raw bytes], [cfg_raw length]);
         if (!cfg) { fprintf(stderr, "Cannot read %s/config.json\n", dir_path.c_str()); return false; }
         NSDictionary* tc = cfg[@"text_config"] ?: cfg;
 
@@ -633,8 +706,9 @@ struct Qwen35Engine {
             int kw = int(rw.shape.back());
             int kg = int(rs.shape.back());
             int N  = int(rw.shape[rw.shape.size() - 2]);
-            int gs = K_expect / kg;
+            int gs = (kg > 0) ? K_expect / kg : 0;
             int bits = (kw * 32) / K_expect;
+            check_qtensor(st_pfx.c_str(), bits, (kg > 0 && K_expect % kg == 0) ? gs : 0, K_expect, N);
             if (bits != 2 && bits != 3 && bits != 4 && bits != 8) {
                 fprintf(stderr, "Unsupported bits=%d for %s\n", bits, st_pfx.c_str()); exit(1);
             }
@@ -743,6 +817,8 @@ struct Qwen35Engine {
         val_lin_dim = lin_vh * lin_vhd;
         q_full_dim  = n_heads * head_dim;
         kv_full_dim = n_kv_heads * head_dim;
+        if (!validate_arch()) return false;
+        model_fp = fnv1a(model_fp, &top_k, sizeof(top_k));   // MoE top-k mengubah state → bagian dari sidik jari
 
         auto try_read = [](const std::string& p) -> NSString* {
             if (p.empty()) return nil;
@@ -780,7 +856,17 @@ struct Qwen35Engine {
         const bool bf = scales_bf16;
         pso_embed         = make_pso(dev, lib, "embed_lookup_q",          false, bf);
         pso_rms           = make_pso(dev, lib, "rms_norm",                false, bf);
-        pso_rep           = make_pso(dev, lib, "apply_rep_penalty_sparse",false, bf);
+        pso_rep           = make_pso(dev, lib, "apply_rep_penalty_rows",  false, bf);
+        pso_qmm4_mmaP     = make_pso(dev, lib, "qmm_4b_mmaP",             false, bf);
+        pso_qmm4_mmaP_add = make_pso(dev, lib, "qmm_4b_mmaP",             true,  bf);
+        pso_qmm2_mmaP     = make_pso(dev, lib, "qmm_2b_mmaP",             false, bf);
+        pso_qmm2_mmaP_add = make_pso(dev, lib, "qmm_2b_mmaP",             true,  bf);
+        pso_sw4_mmaP      = make_pso(dev, lib, "dense_swiglu_4b_mmaP",    false, bf);
+        pso_sw2_mmaP      = make_pso(dev, lib, "dense_swiglu_2b_mmaP",    false, bf);
+        pso_dn_in4_mmaP   = make_pso(dev, lib, "deltanet_in_proj_4b_mmaP",false, bf);
+        pso_full_qkv4_mmaP= make_pso(dev, lib, "q35_qkv_proj_4b_mmaP",    false, bf);
+        pso_conv1d_prefill= make_pso(dev, lib, "deltanet_conv1d_silu_prefill", false, bf);
+        pso_dn_prefill    = make_pso(dev, lib, "deltanet_recurrent_prefill",   false, bf);
         pso_argmax        = make_pso(dev, lib, "argmax_full",             false, bf);
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_dn_in4        = make_pso(dev, lib, "deltanet_in_proj_4b",     false, bf);
@@ -830,38 +916,39 @@ struct Qwen35Engine {
         auto mkbuf = [&](size_t bytes) -> id<MTLBuffer> {
             return [dev newBufferWithLength:std::max<size_t>(bytes, 256) options:MTLResourceStorageModeShared];
         };
-        b_tok       = mkbuf(MAX_M * sizeof(int32_t));
-        b_x         = mkbuf(MAX_M * dim * 2);
-        b_xn        = mkbuf(MAX_M * dim * 2);
-        b_qkv       = mkbuf(MAX_M * qkv_lin_dim * 2);
-        b_z         = mkbuf(MAX_M * val_lin_dim * 2);
-        b_a         = mkbuf(MAX_M * lin_vh * 2);
-        b_b         = mkbuf(MAX_M * lin_vh * 2);
-        b_dn_out    = mkbuf(MAX_M * val_lin_dim * 2);
-        b_q_raw     = mkbuf(MAX_M * 2 * q_full_dim * 2);
-        b_q         = mkbuf(MAX_M * q_full_dim * 2);
-        b_gate      = mkbuf(MAX_M * q_full_dim * 2);
-        b_k         = mkbuf(MAX_M * kv_full_dim * 2);
-        b_v         = mkbuf(MAX_M * kv_full_dim * 2);
-        b_att       = mkbuf(MAX_M * q_full_dim * 2);
-        b_router_l  = mkbuf(MAX_M * std::max(num_experts, 256) * 2);
-        b_sh_gl     = mkbuf(MAX_M * 16);
-        b_top_ids   = mkbuf(MAX_M * std::max(top_k, 16) * sizeof(int32_t));
-        b_top_w     = mkbuf(MAX_M * std::max(top_k, 16) * sizeof(float));
-        b_sh_g      = mkbuf(MAX_M * sizeof(float));
+        b_tok       = mkbuf(MAX_P * sizeof(int32_t));
+        b_x         = mkbuf(MAX_P * dim * 2);
+        b_xn        = mkbuf(MAX_P * dim * 2);
+        b_qkv       = mkbuf(MAX_P * qkv_lin_dim * 2);
+        b_z         = mkbuf(MAX_P * val_lin_dim * 2);
+        b_a         = mkbuf(MAX_P * lin_vh * 2);
+        b_b         = mkbuf(MAX_P * lin_vh * 2);
+        b_dn_out    = mkbuf(MAX_P * val_lin_dim * 2);
+        b_q_raw     = mkbuf(MAX_P * 2 * q_full_dim * 2);
+        b_q         = mkbuf(MAX_P * q_full_dim * 2);
+        b_gate      = mkbuf(MAX_P * q_full_dim * 2);
+        b_k         = mkbuf(MAX_P * kv_full_dim * 2);
+        b_v         = mkbuf(MAX_P * kv_full_dim * 2);
+        b_att       = mkbuf(MAX_P * q_full_dim * 2);
+        b_router_l  = mkbuf(MAX_P * std::max(num_experts, 256) * 2);
+        b_sh_gl     = mkbuf(MAX_P * 16);
+        b_top_ids   = mkbuf(MAX_P * std::max(top_k, 16) * sizeof(int32_t));
+        b_top_w     = mkbuf(MAX_P * std::max(top_k, 16) * sizeof(float));
+        b_sh_g      = mkbuf(MAX_P * sizeof(float));
         b_uniq_cnt  = mkbuf(sizeof(int32_t));
         b_uniq_e    = mkbuf(MAX_M * 16 * sizeof(int32_t));
         b_grp_cnt   = mkbuf(MAX_M * 16 * sizeof(int32_t));
         b_grp_slots = mkbuf(MAX_M * 16 * 8 * sizeof(int32_t));
-        b_sh_h      = mkbuf(MAX_M * std::max(shared_inter, 64) * 2);
-        b_sh_out    = mkbuf(MAX_M * dim * 2);
-        b_moe_h     = mkbuf(MAX_M * std::max(top_k * moe_inter, 64) * 2);
-        b_moe_out   = mkbuf(MAX_M * std::max(top_k * dim, 64) * 2);
-        b_dense_h   = mkbuf(MAX_M * std::max(dense_inter, 64) * 2);
+        b_sh_h      = mkbuf(MAX_P * std::max(shared_inter, 64) * 2);
+        b_sh_out    = mkbuf(MAX_P * dim * 2);
+        b_moe_h     = mkbuf(MAX_P * std::max(top_k * moe_inter, 64) * 2);
+        b_moe_out   = mkbuf(MAX_P * std::max(top_k * dim, 64) * 2);
+        b_dense_h   = mkbuf(MAX_P * std::max(dense_inter, 64) * 2);
         b_logits     = mkbuf(MAX_M * vocab * 2);
         b_out_tok    = mkbuf(MAX_M * sizeof(int32_t));
         b_top64_ids  = mkbuf(MAX_M * 64 * sizeof(int32_t));
         b_top64_vals = mkbuf(MAX_M * 64 * sizeof(float));
+        b_top64_flag = mkbuf(MAX_M * sizeof(int32_t));
 
         conv_states.resize(n_layers, nil); dn_states.resize(n_layers, nil);
         k_caches.resize(n_layers, nil);    v_caches.resize(n_layers, nil);
@@ -892,6 +979,29 @@ struct Qwen35Engine {
                 arch_name.c_str(), n_layers, dim, head_dim,
                 is_moe ? (std::string("MoE E=") + std::to_string(num_experts) + " topK=" + std::to_string(top_k)).c_str()
                        : (std::string("Dense inter=") + std::to_string(dense_inter)).c_str(), vocab);
+        return true;
+    }
+
+    // Kernel di file ini punya asumsi tetap (head_dim 256, rope 64, conv 4, head DeltaNet 128, ≤256 expert).
+    // Model lain lolos load tapi menghasilkan teks rusak — lebih baik gagal keras di sini.
+    bool validate_arch() const {
+        bool has_attn = false, has_dn = false;
+        for (const auto& L : layers) (L.type == 0 ? has_dn : has_attn) = true;
+        auto bad = [](const char* why) { fprintf(stderr, "✗ Arsitektur tidak didukung engine qwen35: %s\n", why); return false; };
+        if (dim <= 0 || dim % 16) return bad("hidden_size harus kelipatan 16");
+        if (has_attn) {
+            if (head_dim != 256) return bad("head_dim harus 256 (kernel attention hd=256)");
+            if (rope_dim != 64) return bad("rope_dim (head_dim × partial_rotary_factor) harus 64");
+            if (n_kv_heads <= 0 || n_heads % n_kv_heads) return bad("num_attention_heads harus kelipatan num_key_value_heads");
+        }
+        if (has_dn) {
+            if (conv_k != 4) return bad("linear_conv_kernel_dim harus 4");
+            if (lin_khd != 128) return bad("linear_key_head_dim harus 128");
+            if (lin_vhd <= 0 || lin_vhd > 128) return bad("linear_value_head_dim harus 1..128");
+            if (lin_kh <= 0 || lin_vh % lin_kh) return bad("linear_num_value_heads harus kelipatan linear_num_key_heads");
+        }
+        if (is_moe && (num_experts > 256 || top_k < 1 || top_k > num_experts || top_k > 16))
+            return bad("MoE butuh num_experts ≤ 256 dan 1 ≤ top_k ≤ min(16, num_experts)");
         return true;
     }
 
@@ -966,58 +1076,67 @@ struct Qwen35Engine {
         }
     }
 
+    // Format .tstate v2: "TSTATE02" | int32[8] {n_layers, dim, n_kv_heads, head_dim, pos, n_ids, top_k, vocab}
+    //                   | uint64 model_fp | ids | per layer: uint64[2] ukuran + data.
+    // Saat dimuat, SETIAP ukuran dicek terhadap buffer engine (versi lama mem-memcpy ukuran dari file →
+    // file rusak/asing bisa menimpa memori) dan sidik jari model harus sama (model lain dgn bentuk sama
+    // akan lolos lalu menghasilkan teks rusak).
     bool save_snapshot_file(const StateSnapshot& snap, const std::string& path) const {
-        FILE* f = fopen(path.c_str(), "wb");
+        const std::string tmp = path + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "wb");
         if (!f) { perror(("save " + path).c_str()); return false; }
-        const char magic[8] = {'T','S','T','A','T','E','0','1'};
-        int32_t hdr[6] = {n_layers, dim, n_kv_heads, head_dim, snap.pos, int32_t(snap.ids.size())};
-        fwrite(magic, 1, 8, f);
-        fwrite(hdr, sizeof(int32_t), 6, f);
-        fwrite(snap.ids.data(), sizeof(int32_t), snap.ids.size(), f);
-        for (int l = 0; l < n_layers; ++l) {
-            if (layers[l].type == 0) {
-                uint64_t sz[2] = {snap.conv_data[l].size(), snap.dn_data[l].size()};
-                fwrite(sz, sizeof(uint64_t), 2, f);
-                fwrite(snap.conv_data[l].data(), 1, sz[0], f);
-                fwrite(snap.dn_data[l].data(),   1, sz[1], f);
-            } else {
-                uint64_t sz[2] = {snap.k_data[l].size(), snap.v_data[l].size()};
-                fwrite(sz, sizeof(uint64_t), 2, f);
-                fwrite(snap.k_data[l].data(), 1, sz[0], f);
-                fwrite(snap.v_data[l].data(), 1, sz[1], f);
-            }
+        const char magic[8] = {'T','S','T','A','T','E','0','2'};
+        int32_t hdr[8] = {n_layers, dim, n_kv_heads, head_dim, snap.pos, int32_t(snap.ids.size()), top_k, vocab};
+        bool ok = fwrite(magic, 1, 8, f) == 8 && fwrite(hdr, sizeof(int32_t), 8, f) == 8 &&
+                  fwrite(&model_fp, sizeof(model_fp), 1, f) == 1 &&
+                  fwrite(snap.ids.data(), sizeof(int32_t), snap.ids.size(), f) == snap.ids.size();
+        for (int l = 0; ok && l < n_layers; ++l) {
+            const auto& d0 = (layers[l].type == 0) ? snap.conv_data[l] : snap.k_data[l];
+            const auto& d1 = (layers[l].type == 0) ? snap.dn_data[l]   : snap.v_data[l];
+            uint64_t sz[2] = {d0.size(), d1.size()};
+            ok = fwrite(sz, sizeof(uint64_t), 2, f) == 2 && fwrite(d0.data(), 1, sz[0], f) == sz[0] &&
+                 fwrite(d1.data(), 1, sz[1], f) == sz[1];
         }
-        fclose(f);
-        return true;
+        ok = (fclose(f) == 0) && ok;
+        if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok) { remove(tmp.c_str()); fprintf(stderr, "✗ Gagal menulis %s\n", path.c_str()); }
+        return ok;
     }
 
     bool load_snapshot_file(StateSnapshot& snap, const std::string& path) const {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) { perror(("open " + path).c_str()); return false; }
+        auto fail = [&](const char* why) { fprintf(stderr, "✗ .tstate ditolak (%s): %s\n", path.c_str(), why); fclose(f); return false; };
         char magic[8] = {0};
-        int32_t hdr[6] = {0};
-        if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "TSTATE01", 8) != 0) { fclose(f); return false; }
-        if (fread(hdr, sizeof(int32_t), 6, f) != 6) { fclose(f); return false; }
-        if (hdr[0] != n_layers || hdr[1] != dim || hdr[2] != n_kv_heads || hdr[3] != head_dim || hdr[4] >= max_seq) {
-            fprintf(stderr, "State file architecture mismatch!\n"); fclose(f); return false;
-        }
-        snap.pos = hdr[4];
-        snap.ids.resize(size_t(hdr[5]));
-        if (fread(snap.ids.data(), sizeof(int32_t), snap.ids.size(), f) != snap.ids.size()) { fclose(f); return false; }
+        int32_t hdr[8] = {0};
+        uint64_t fp = 0;
+        if (fread(magic, 1, 8, f) != 8) return fail("file terlalu pendek");
+        if (memcmp(magic, "TSTATE01", 8) == 0) return fail("format lama TSTATE01 tanpa validasi — bake ulang");
+        if (memcmp(magic, "TSTATE02", 8) != 0) return fail("bukan file .tstate");
+        if (fread(hdr, sizeof(int32_t), 8, f) != 8 || fread(&fp, sizeof(fp), 1, f) != 1) return fail("header terpotong");
+        if (fp != model_fp) return fail("dibuat dari model/konfigurasi lain (sidik jari berbeda, termasuk --top-k)");
+        if (hdr[0] != n_layers || hdr[1] != dim || hdr[2] != n_kv_heads || hdr[3] != head_dim || hdr[6] != top_k || hdr[7] != vocab)
+            return fail("arsitektur berbeda");
+        const int pos = hdr[4], n_ids = hdr[5];
+        if (pos <= 0 || pos + 9 > max_seq || n_ids != pos) return fail("panjang prefix tidak valid untuk --max-seq ini");
+        snap.pos = pos;
+        snap.ids.resize(size_t(n_ids));
+        if (fread(snap.ids.data(), sizeof(int32_t), snap.ids.size(), f) != snap.ids.size()) return fail("token terpotong");
+        for (int32_t t : snap.ids) if (t < 0 || t >= vocab) return fail("token di luar vocab");
         snap.conv_data.assign(n_layers, {}); snap.dn_data.assign(n_layers, {});
         snap.k_data.assign(n_layers, {});    snap.v_data.assign(n_layers, {});
+        const uint64_t kv_bytes = uint64_t(n_kv_heads) * uint64_t(pos) * uint64_t(head_dim) * 2;
         for (int l = 0; l < n_layers; ++l) {
             uint64_t sz[2] = {0, 0};
-            if (fread(sz, sizeof(uint64_t), 2, f) != 2) { fclose(f); return false; }
-            if (layers[l].type == 0) {
-                snap.conv_data[l].resize(sz[0]); snap.dn_data[l].resize(sz[1]);
-                if (fread(snap.conv_data[l].data(), 1, sz[0], f) != sz[0]) { fclose(f); return false; }
-                if (fread(snap.dn_data[l].data(),   1, sz[1], f) != sz[1]) { fclose(f); return false; }
-            } else {
-                snap.k_data[l].resize(sz[0]); snap.v_data[l].resize(sz[1]);
-                if (fread(snap.k_data[l].data(), 1, sz[0], f) != sz[0]) { fclose(f); return false; }
-                if (fread(snap.v_data[l].data(), 1, sz[1], f) != sz[1]) { fclose(f); return false; }
-            }
+            if (fread(sz, sizeof(uint64_t), 2, f) != 2) return fail("data layer terpotong");
+            const bool dn = (layers[l].type == 0);
+            const uint64_t e0 = dn ? uint64_t([conv_states[l] length]) : kv_bytes;
+            const uint64_t e1 = dn ? uint64_t([dn_states[l] length])   : kv_bytes;
+            if (sz[0] != e0 || sz[1] != e1) return fail("ukuran state layer tidak cocok");
+            auto& d0 = dn ? snap.conv_data[l] : snap.k_data[l];
+            auto& d1 = dn ? snap.dn_data[l]   : snap.v_data[l];
+            d0.resize(size_t(sz[0])); d1.resize(size_t(sz[1]));
+            if (fread(d0.data(), 1, sz[0], f) != sz[0] || fread(d1.data(), 1, sz[1], f) != sz[1]) return fail("data layer terpotong");
         }
         fclose(f);
         return true;
@@ -1050,54 +1169,64 @@ struct Qwen35Engine {
         bar(e);
     }
 
-    void enc_qmv(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& qt, id<MTLBuffer> outp, bool add_res) {
+    // Proyeksi terkuantisasi untuk M baris (M ≤ MAX_P). in_row/out_row = offset dalam BARIS (stride K / N).
+    //   M=1        : qmv dual-row (decode)
+    //   M=4..8     : MMA 1 tile   (verifikasi spekulatif)
+    //   M=9..32    : MMA 4 tile   (prefill) — tile bobot dipakai ulang untuk 32 token
+    //   lainnya    : qmv multi-token; M>8 tanpa MMA (3/8-bit) dipecah per 8 baris (kernelnya hanya 8 akumulator)
+    void enc_qmv(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& qt, id<MTLBuffer> outp,
+                 bool add_res, int in_row = 0, int out_row = 0) {
+        const bool mma_ok = (qt.bits == 4 || qt.bits == 2) && (qt.K % 64 == 0);
+        if (M > MAX_M && !mma_ok) {
+            for (int r0 = 0; r0 < M; r0 += MAX_M)
+                enc_qmv(e, std::min(MAX_M, M - r0), inp, qt, outp, add_res, in_row + r0, out_row + r0);
+            return;
+        }
+        const NSUInteger ioff = NSUInteger(in_row) * NSUInteger(qt.K) * 2;
+        const NSUInteger ooff = NSUInteger(out_row) * NSUInteger(qt.N) * 2;
+        id<MTLComputePipelineState> pso; int rows_per_tg; bool multi = true;
         if (M == 1) {
-            QMVParams p{qt.K, qt.N, qt.gs_shift};
-            [e setComputePipelineState:(add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits])];
-            [e setBuffer:inp offset:0 atIndex:0];
-            [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
-            [e setBuffer:outp offset:0 atIndex:4]; [e setBytes:&p length:sizeof(p) atIndex:5];
-            [e dispatchThreadgroups:MTLSizeMake((qt.N + 7) / 8, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        } else if (M >= 4 && (qt.bits == 4 || qt.bits == 2) && (qt.K % 64 == 0)) {
-            QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift};
-            id<MTLComputePipelineState> pso = (qt.bits == 4)
-                ? (add_res ? pso_qmm4_mma8_add : pso_qmm4_mma8)
-                : (add_res ? pso_qmm2_mma8_add : pso_qmm2_mma8);
-            [e setComputePipelineState:pso];
-            [e setBuffer:inp offset:0 atIndex:0];
-            [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
-            [e setBuffer:outp offset:0 atIndex:4]; [e setBytes:&p length:sizeof(p) atIndex:5];
-            [e dispatchThreadgroups:MTLSizeMake((qt.N + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
+        } else if (M >= 4 && mma_ok) {
+            if (M > MAX_M) pso = (qt.bits == 4) ? (add_res ? pso_qmm4_mmaP_add : pso_qmm4_mmaP) : (add_res ? pso_qmm2_mmaP_add : pso_qmm2_mmaP);
+            else           pso = (qt.bits == 4) ? (add_res ? pso_qmm4_mma8_add : pso_qmm4_mma8) : (add_res ? pso_qmm2_mma8_add : pso_qmm2_mma8);
+            rows_per_tg = 32;
         } else {
-            QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift};
-            [e setComputePipelineState:(add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits])];
-            [e setBuffer:inp offset:0 atIndex:0];
-            [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
-            [e setBuffer:outp offset:0 atIndex:4]; [e setBytes:&p length:sizeof(p) atIndex:5];
-            [e dispatchThreadgroups:MTLSizeMake((qt.N + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
         }
+        [e setComputePipelineState:pso];
+        [e setBuffer:inp offset:ioff atIndex:0];
+        [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
+        [e setBuffer:outp offset:ooff atIndex:4];
+        if (multi) { QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift}; [e setBytes:&p length:sizeof(p) atIndex:5]; }
+        else       { QMVParams p{qt.K, qt.N, qt.gs_shift};         [e setBytes:&p length:sizeof(p) atIndex:5]; }
+        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
-    void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp) {
+    void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp,
+                    int row0 = 0) {
+        const bool mma_ok = (gp.bits == 4 || gp.bits == 2) && gp.bits == up.bits && (gp.K % 64 == 0);
+        if (M > MAX_M && !mma_ok) {
+            for (int r0 = 0; r0 < M; r0 += MAX_M) enc_swiglu(e, std::min(MAX_M, M - r0), inp, gp, up, outp, row0 + r0);
+            return;
+        }
         QMVMultiParams p{M, gp.K, gp.N, gp.gs_shift};
-        if (M >= 4 && (gp.bits == 4 || gp.bits == 2) && gp.bits == up.bits && (gp.K % 64 == 0)) {
-            [e setComputePipelineState:(gp.bits == 4 ? pso_sw4_mma8 : pso_sw2_mma8)];
-            [e setBuffer:inp offset:0 atIndex:0];
-            [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
-            [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
-            [e setBuffer:outp offset:0 atIndex:7]; [e setBytes:&p length:sizeof(p) atIndex:8];
-            [e dispatchThreadgroups:MTLSizeMake((gp.N + 31) / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        } else {
-            [e setComputePipelineState:pso_sw[gp.bits]];
-            [e setBuffer:inp offset:0 atIndex:0];
-            [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
-            [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
-            [e setBuffer:outp offset:0 atIndex:7]; [e setBytes:&p length:sizeof(p) atIndex:8];
-            [e dispatchThreadgroups:MTLSizeMake((gp.N + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        }
+        const bool use_mma = (M >= 4 && mma_ok);
+        id<MTLComputePipelineState> pso = use_mma
+            ? (M > MAX_M ? (gp.bits == 4 ? pso_sw4_mmaP : pso_sw2_mmaP) : (gp.bits == 4 ? pso_sw4_mma8 : pso_sw2_mma8))
+            : pso_sw[gp.bits];
+        const int rows_per_tg = use_mma ? 32 : 4;
+        [e setComputePipelineState:pso];
+        [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
+        [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
+        [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
+        [e setBuffer:outp offset:NSUInteger(row0) * NSUInteger(gp.N) * 2 atIndex:7]; [e setBytes:&p length:sizeof(p) atIndex:8];
+        [e dispatchThreadgroups:MTLSizeMake((gp.N + rows_per_tg - 1) / rows_per_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
-    void enc_layer_attn(id<MTLComputeCommandEncoder> e, int M, int l, int pos) {
+    // prefill=true: DeltaNet memakai kernel prefill (state langsung diperbarui, M bebas, tanpa commit tertunda).
+    // prefill=false & M>1: verifikasi spekulatif (state hanya dibaca, riwayat untuk commit token yang diterima).
+    void enc_layer_attn(id<MTLComputeCommandEncoder> e, int M, int l, int pos, bool prefill = false) {
         const auto& L = layers[l];
         NormParams np{dim, rms_eps};
         [e setComputePipelineState:pso_rms];
@@ -1108,11 +1237,13 @@ struct Qwen35Engine {
 
         if (L.type == 0) {
             if (L.in_qkv.bits == 4 && L.in_z.bits == 4 && L.in_a.bits == 4 && L.in_b.bits == 4 &&
-                L.in_qkv.gs_shift == L.in_z.gs_shift && L.in_qkv.gs_shift == L.in_a.gs_shift) {
+                L.in_qkv.gs_shift == L.in_z.gs_shift && L.in_qkv.gs_shift == L.in_a.gs_shift &&
+                L.in_qkv.gs_shift == L.in_b.gs_shift && (M <= MAX_M || dim % 64 == 0)) {
                 DeltaNetInParams dp{M, dim, L.in_qkv.gs_shift, L.in_qkv.N, L.in_z.N, L.in_a.N, L.in_b.N};
                 int tot_n = L.in_qkv.N + L.in_z.N + L.in_a.N + L.in_b.N;
-                id<MTLComputePipelineState> pso_dn = (M == 1) ? pso_dn_in4_m1 : ((M >= 4 && (dim % 64 == 0)) ? pso_dn_in4_mma8 : pso_dn_in4);
-                int rpt_dn = (M == 1) ? 8 : ((M >= 4 && (dim % 64 == 0)) ? 32 : 4);
+                const bool mma = (M >= 4 && (dim % 64 == 0));
+                id<MTLComputePipelineState> pso_dn = (M == 1) ? pso_dn_in4_m1 : (mma ? (M > MAX_M ? pso_dn_in4_mmaP : pso_dn_in4_mma8) : pso_dn_in4);
+                int rpt_dn = (M == 1) ? 8 : (mma ? 32 : 4);
                 [e setComputePipelineState:pso_dn];
                 [e setBuffer:b_xn offset:0 atIndex:0];
                 [e setBuffer:L.in_qkv.w_buf offset:L.in_qkv.w atIndex:1];  [e setBuffer:L.in_qkv.s_buf offset:L.in_qkv.s atIndex:2];  [e setBuffer:L.in_qkv.b_buf offset:L.in_qkv.b atIndex:3];
@@ -1132,7 +1263,12 @@ struct Qwen35Engine {
             bar(e);
 
             Conv1dParams cp{M, qkv_lin_dim, conv_k};
-            if (M == 1) {
+            if (prefill && M > 1) {
+                [e setComputePipelineState:pso_conv1d_prefill];
+                [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:conv_states[l] offset:0 atIndex:1];
+                [e setBuffer:L.conv_w.buf offset:L.conv_w.off atIndex:2]; [e setBytes:&cp length:sizeof(cp) atIndex:3];
+                [e dispatchThreads:MTLSizeMake(qkv_lin_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else if (M == 1) {
                 [e setComputePipelineState:pso_conv1d_m1];
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:conv_states[l] offset:0 atIndex:1];
                 [e setBuffer:L.conv_w.buf offset:L.conv_w.off atIndex:2]; [e setBytes:&cp length:sizeof(cp) atIndex:3];
@@ -1147,8 +1283,8 @@ struct Qwen35Engine {
             bar(e);
 
             DeltaNetParams dp{M, lin_kh, lin_vh, lin_khd, lin_vhd, rms_eps};
-            if (M == 1) {
-                [e setComputePipelineState:pso_dn_m1];
+            if (M == 1 || prefill) {
+                [e setComputePipelineState:(M == 1 ? pso_dn_m1 : pso_dn_prefill)];
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:b_z offset:0 atIndex:1];
                 [e setBuffer:b_a offset:0 atIndex:2];   [e setBuffer:b_b offset:0 atIndex:3];
                 [e setBuffer:L.A_log.buf offset:L.A_log.off atIndex:4]; [e setBuffer:L.dt_bias.buf offset:L.dt_bias.off atIndex:5];
@@ -1172,11 +1308,13 @@ struct Qwen35Engine {
             enc_qmv(e, M, b_dn_out, L.out_p, b_x, true);
             bar(e);
         } else {
-            if (L.q.bits == 4 && L.k.bits == 4 && L.v.bits == 4 && L.q.gs_shift == L.k.gs_shift) {
+            if (L.q.bits == 4 && L.k.bits == 4 && L.v.bits == 4 && L.q.gs_shift == L.k.gs_shift &&
+                L.q.gs_shift == L.v.gs_shift && (M <= MAX_M || dim % 64 == 0)) {
                 FullQKVParams qp{M, dim, L.q.gs_shift, L.q.N, L.k.N, L.v.N};
                 int tot_n = L.q.N + L.k.N + L.v.N;
-                id<MTLComputePipelineState> pso_fq = (M == 1) ? pso_full_qkv4_m1 : ((M >= 4 && (dim % 64 == 0)) ? pso_full_qkv4_mma8 : pso_full_qkv4);
-                int rpt_fq = (M == 1) ? 8 : ((M >= 4 && (dim % 64 == 0)) ? 32 : 4);
+                const bool mma = (M >= 4 && (dim % 64 == 0));
+                id<MTLComputePipelineState> pso_fq = (M == 1) ? pso_full_qkv4_m1 : (mma ? (M > MAX_M ? pso_full_qkv4_mmaP : pso_full_qkv4_mma8) : pso_full_qkv4);
+                int rpt_fq = (M == 1) ? 8 : (mma ? 32 : 4);
                 [e setComputePipelineState:pso_fq];
                 [e setBuffer:b_xn offset:0 atIndex:0];
                 [e setBuffer:L.q.w_buf offset:L.q.w atIndex:1]; [e setBuffer:L.q.s_buf offset:L.q.s atIndex:2]; [e setBuffer:L.q.b_buf offset:L.q.b atIndex:3];
@@ -1228,14 +1366,19 @@ struct Qwen35Engine {
         if (is_moe) {
             // Wave 1 (Concurrent): Router+ShGate + Shared-Expert SwiGLU
             if (L.router.bits == L.sh_gate.bits && (L.router.bits == 8 || L.router.bits == 4) && L.router.gs_shift == L.sh_gate.gs_shift) {
-                QMVMultiParams qp{M, L.router.K, L.router.N, L.router.gs_shift};
-                [e setComputePipelineState:(L.router.bits == 8 ? pso_router_sh8 : pso_router_sh4)];
-                [e setBuffer:b_xn offset:0 atIndex:0];
-                [e setBuffer:L.router.w_buf  offset:L.router.w  atIndex:1]; [e setBuffer:L.router.s_buf  offset:L.router.s  atIndex:2]; [e setBuffer:L.router.b_buf  offset:L.router.b  atIndex:3];
-                [e setBuffer:L.sh_gate.w_buf offset:L.sh_gate.w atIndex:4]; [e setBuffer:L.sh_gate.s_buf offset:L.sh_gate.s atIndex:5]; [e setBuffer:L.sh_gate.b_buf offset:L.sh_gate.b atIndex:6];
-                [e setBuffer:b_router_l offset:0 atIndex:7]; [e setBuffer:b_sh_gl offset:0 atIndex:8];
-                [e setBytes:&qp length:sizeof(qp) atIndex:9];
-                [e dispatchThreadgroups:MTLSizeMake((L.router.N + 3) / 4 + 1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                // kernel router hanya punya 8 akumulator token → pecah per 8 baris saat prefill
+                for (int r0 = 0; r0 < M; r0 += MAX_M) {
+                    const int mb = std::min(MAX_M, M - r0);
+                    QMVMultiParams qp{mb, L.router.K, L.router.N, L.router.gs_shift};
+                    [e setComputePipelineState:(L.router.bits == 8 ? pso_router_sh8 : pso_router_sh4)];
+                    [e setBuffer:b_xn offset:NSUInteger(r0) * NSUInteger(L.router.K) * 2 atIndex:0];
+                    [e setBuffer:L.router.w_buf  offset:L.router.w  atIndex:1]; [e setBuffer:L.router.s_buf  offset:L.router.s  atIndex:2]; [e setBuffer:L.router.b_buf  offset:L.router.b  atIndex:3];
+                    [e setBuffer:L.sh_gate.w_buf offset:L.sh_gate.w atIndex:4]; [e setBuffer:L.sh_gate.s_buf offset:L.sh_gate.s atIndex:5]; [e setBuffer:L.sh_gate.b_buf offset:L.sh_gate.b atIndex:6];
+                    [e setBuffer:b_router_l offset:NSUInteger(r0) * NSUInteger(L.router.N) * 2 atIndex:7];
+                    [e setBuffer:b_sh_gl offset:NSUInteger(r0) * 2 atIndex:8];
+                    [e setBytes:&qp length:sizeof(qp) atIndex:9];
+                    [e dispatchThreadgroups:MTLSizeMake((L.router.N + 3) / 4 + 1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                }
             } else {
                 enc_qmv(e, M, b_xn, L.router,  b_router_l, false);
                 enc_qmv(e, M, b_xn, L.sh_gate, b_sh_gl,    false);
@@ -1286,9 +1429,18 @@ struct Qwen35Engine {
         }
     }
 
+    // Satu langkah = satu command buffer untuk seluruh model.
+    //   prefill        : DeltaNet memperbarui state langsung (M bebas ≤ MAX_P)
+    //   head_last_only : lm_head + argmax/top-64 HANYA untuk baris terakhir (prefill tidak butuh logits baris lain;
+    //                    head 248K vocab untuk 32 baris adalah kerja sia-sia). Hasil ada di indeks 0.
     void run_step_m(const int32_t* ids, int M, int pos, int32_t* out_ids,
-                    bool run_head, const SparseRepParams& rp, double* gpu_ms_out = nullptr,
-                    bool want_top64 = false, int32_t* top64_ids_out = nullptr, float* top64_vals_out = nullptr) {
+                    bool run_head, const RepRowsParams& rp, double* gpu_ms_out = nullptr,
+                    bool want_top64 = false, int32_t* top64_ids_out = nullptr, float* top64_vals_out = nullptr,
+                    bool prefill = false, bool head_last_only = false) {
+        if (M < 1 || M > (prefill ? MAX_P : MAX_M) || pos < 0 || pos + M > max_seq) {
+            fprintf(stderr, "✗ run_step di luar batas: pos=%d M=%d max_seq=%d\n", pos, M, max_seq);
+            exit(1);
+        }
         memcpy([b_tok contents], ids, size_t(M) * sizeof(int32_t));
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
@@ -1308,24 +1460,26 @@ struct Qwen35Engine {
         bar(e);
 
         for (int l = 0; l < n_layers; ++l) {
-            enc_layer_attn(e, M, l, pos);
+            enc_layer_attn(e, M, l, pos, prefill);
             enc_layer_ffn(e, M, l);
         }
 
+        const int HM = head_last_only ? 1 : M;
         if (run_head) {
             NormParams np{dim, rms_eps};
             [e setComputePipelineState:pso_rms];
-            [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:fnorm_s.buf offset:fnorm_s.off atIndex:1];
+            [e setBuffer:b_x offset:(head_last_only ? NSUInteger(M - 1) * NSUInteger(dim) * 2 : 0) atIndex:0];
+            [e setBuffer:fnorm_s.buf offset:fnorm_s.off atIndex:1];
             [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
-            [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             bar(e);
 
-            enc_qmv(e, M, b_xn, lm_head, b_logits, false);
+            enc_qmv(e, HM, b_xn, lm_head, b_logits, false);
             bar(e);
-            if (rp.penalty > 1.001f && rp.n_slots > 0) {
+            if (!head_last_only && rep_active(rp) && rp.M == M) {
                 [e setComputePipelineState:pso_rep];
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBytes:&rp length:sizeof(rp) atIndex:1];
-                [e dispatchThreads:MTLSizeMake(rp.n_slots, M, 1) threadsPerThreadgroup:MTLSizeMake(std::min(rp.n_slots, 64), 1, 1)];
+                [e dispatchThreads:MTLSizeMake(REP_WIN, M, 1) threadsPerThreadgroup:MTLSizeMake(REP_WIN, 1, 1)];
                 bar(e);
             }
             if (want_top64) {
@@ -1334,12 +1488,13 @@ struct Qwen35Engine {
                 [e setBuffer:b_top64_ids offset:0 atIndex:1];
                 [e setBuffer:b_top64_vals offset:0 atIndex:2];
                 [e setBytes:&vocab length:sizeof(vocab) atIndex:3];
-                [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [e setBuffer:b_top64_flag offset:0 atIndex:4];
+                [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
                 [e setComputePipelineState:pso_argmax];
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBuffer:b_out_tok offset:0 atIndex:1];
                 [e setBytes:&vocab length:sizeof(vocab) atIndex:2];
-                [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
         }
 
@@ -1349,15 +1504,32 @@ struct Qwen35Engine {
         if (gpu_ms_out) *gpu_ms_out = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         if (run_head) {
             if (want_top64) {
-                if (top64_ids_out)  memcpy(top64_ids_out,  [b_top64_ids contents],  size_t(M) * 64 * sizeof(int32_t));
-                if (top64_vals_out) memcpy(top64_vals_out, [b_top64_vals contents], size_t(M) * 64 * sizeof(float));
-                if (out_ids) {
-                    const int32_t* p64 = (const int32_t*)[b_top64_ids contents];
-                    for (int m = 0; m < M; ++m) out_ids[m] = p64[m * 64];
-                }
+                int32_t* ids64 = (int32_t*)[b_top64_ids contents];
+                float* vals64  = (float*)[b_top64_vals contents];
+                const int32_t* flags = (const int32_t*)[b_top64_flag contents];
+                for (int m = 0; m < HM; ++m) if (flags[m]) cpu_top64(m, ids64 + m * 64, vals64 + m * 64);
+                if (top64_ids_out)  memcpy(top64_ids_out,  ids64,  size_t(HM) * 64 * sizeof(int32_t));
+                if (top64_vals_out) memcpy(top64_vals_out, vals64, size_t(HM) * 64 * sizeof(float));
+                if (out_ids) for (int m = 0; m < HM; ++m) out_ids[m] = ids64[m * 64];
             } else if (out_ids) {
-                memcpy(out_ids, [b_out_tok contents], size_t(M) * sizeof(int32_t));
+                memcpy(out_ids, [b_out_tok contents], size_t(HM) * sizeof(int32_t));
             }
+        }
+    }
+
+    // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
+    void cpu_top64(int m, int32_t* ids, float* vals) const {
+        const __fp16* row = (const __fp16*)[b_logits contents] + size_t(m) * size_t(vocab);
+        std::vector<int32_t> idx(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) idx[size_t(i)] = i;
+        const int k = std::min(64, vocab);
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t a, int32_t b) {
+            const float fa = float(row[a]), fb = float(row[b]);
+            return fa > fb || (fa == fb && a < b);
+        });
+        for (int i = 0; i < 64; ++i) {
+            ids[i]  = (i < k) ? idx[size_t(i)] : idx[0];
+            vals[i] = (i < k) ? float(row[idx[size_t(i)]]) : -INFINITY;
         }
     }
 
@@ -1368,25 +1540,23 @@ struct Qwen35Engine {
     void prefill_range(const std::vector<int32_t>& pids, size_t start, size_t end, int& pos,
                        bool run_last_head, bool want_top64, int32_t* last_out_id,
                        int32_t* last_top64_ids, float* last_top64_vals) {
-        SparseRepParams no_rp{MAX_M, vocab, 0, 1.0f, {}};
-        int32_t out_ids[MAX_M] = {0};
-        int32_t t64_i[MAX_M * 64];
-        float   t64_v[MAX_M * 64];
-        for (size_t i = start; i < end; i += MAX_M) {
-            int chunk = int(std::min<size_t>(MAX_M, end - i));
-            bool is_last = run_last_head && (i + size_t(chunk) == end);
-            no_rp.M = chunk;
-            run_step_m(pids.data() + i, chunk, pos, out_ids, is_last, no_rp, nullptr,
-                       is_last && want_top64, t64_i, t64_v);
-            if (chunk > 1) pending_dn_commit = chunk;
+        const RepRowsParams no_rp{};
+        const int chunk_max = std::max(1, std::min(prefill_chunk, int(MAX_P)));
+        int32_t out_id = 0;
+        int32_t t64_i[64];
+        float   t64_v[64];
+        for (size_t i = start; i < end; i += size_t(chunk_max)) {
+            const int chunk = int(std::min<size_t>(size_t(chunk_max), end - i));
+            const bool is_last = run_last_head && (i + size_t(chunk) == end);
+            run_step_m(pids.data() + i, chunk, pos, &out_id, is_last, no_rp, nullptr,
+                       is_last && want_top64, t64_i, t64_v, /*prefill=*/true, /*head_last_only=*/true);
             for (int c = 0; c < chunk; ++c) cached_ids.push_back(pids[i + size_t(c)]);
             pos += chunk;
             if (is_last) {
-                int last_m = chunk - 1;
-                if (last_out_id) *last_out_id = out_ids[last_m];
+                if (last_out_id) *last_out_id = out_id;
                 if (want_top64 && last_top64_ids && last_top64_vals) {
-                    memcpy(last_top64_ids,  t64_i + last_m * 64, 64 * sizeof(int32_t));
-                    memcpy(last_top64_vals, t64_v + last_m * 64, 64 * sizeof(float));
+                    memcpy(last_top64_ids,  t64_i, 64 * sizeof(int32_t));
+                    memcpy(last_top64_vals, t64_v, 64 * sizeof(float));
                 }
             }
         }
@@ -1438,7 +1608,7 @@ struct Qwen35Engine {
 
     void measure_step_costs(double cost[9]) {
         int32_t d_in[8] = {16, 11, 220, 17, 11, 220, 18, 11}, d_out[8];
-        SparseRepParams no_rp{8, vocab, 0, 1.0f, {}};
+        const RepRowsParams no_rp{};
         for (int w = 0; w < 2; ++w) { run_step_m(d_in, 4, 32, d_out, true, no_rp); pending_dn_commit = 0; }
         for (int m : {1, 2, 4, 6, 8}) {
             std::vector<double> ts;
@@ -1456,7 +1626,7 @@ struct Qwen35Engine {
     }
 
     void profile_xray(const double cost[9]) {
-        SparseRepParams no_rp{1, vocab, 0, 1.0f, {}};
+        const RepRowsParams no_rp{};
         int32_t d_in[8] = {16, 11, 220, 17, 11, 220, 18, 11}, o_out[8];
         for (int w = 0; w < 2; ++w) { run_step_m(d_in, 8, 32, o_out, true, no_rp); pending_dn_commit = 0; }
 
@@ -1602,25 +1772,27 @@ static SpecStats generate_adaptive(
     st.tokens.push_back(nxt);
     if (stream_stdout) { printf("{\"tok\":%d}\n", nxt); fflush(stdout); }
 
-    double alpha = 0.75;
+    OrderAlpha oa;
     int32_t batch[8], out_ids[8];
     auto td0 = std::chrono::high_resolution_clock::now();
 
     while ((ignore_eos || !eng.is_eos(nxt)) && int(st.tokens.size()) < max_tokens && pos < eng.max_seq - 9) {
         int rem = max_tokens - int(st.tokens.size());
-        int kk = (max_spec > 0) ? std::min(choose_best_k(alpha, cost, max_spec), rem) : 0;
+        const int ord = (max_spec > 0) ? sfx.match_order() : 0;
+        const int kk = ord ? std::min(choose_best_k(oa.alpha(ord), cost, max_spec), rem) : 0;
         auto draft = sfx.propose(kk);
         int M = 1 + int(draft.size());
         batch[0] = nxt;
         for (int i = 0; i < int(draft.size()); ++i) batch[1 + i] = draft[i];
         st.proposed += (M - 1);
 
-        SparseRepParams rp = build_rep(st.tokens, M, eng.vocab, sc.rep_pen);
+        const RepRowsParams rp = build_rep_rows(st.tokens, batch, M, eng.vocab, sc.rep_pen);
         eng.run_step_m(batch, M, pos, out_ids, true, rp, nullptr, do_sample, t64_ids, t64_vals);
         st.steps++;
 
         std::vector<int32_t> emitted;
         int acc = 0;
+        bool was_rejected = false;
 
         if (!do_sample) {
             while (acc < M - 1 && batch[1 + acc] == out_ids[acc]) {
@@ -1628,6 +1800,7 @@ static SpecStats generate_adaptive(
                 acc++;
             }
             emitted.push_back(out_ids[acc]);
+            was_rejected = (acc < M - 1);
         } else {
             // 100% Lossless Speculative Rejection Sampling for Deterministic Draft (q(d) = 1)!
             bool rejected = false;
@@ -1645,6 +1818,7 @@ static SpecStats generate_adaptive(
                     int32_t corr = sample_categorical(t64_ids + i * 64, probs, rng, d_idx);
                     emitted.push_back(corr);
                     rejected = true;
+                    was_rejected = true;
                     break;
                 }
             }
@@ -1659,16 +1833,17 @@ static SpecStats generate_adaptive(
         st.accepted += acc;
         int n_emit = int(emitted.size());
 
-        if (M > 1) {
-            eng.pending_dn_commit = n_emit;
-            alpha = std::min(0.98, std::max(0.05, 0.70 * alpha + 0.30 * (double(acc) / (M - 1))));
-        } else {
-            alpha += 0.05 * (0.75 - alpha);
-        }
+        if (M > 1) eng.pending_dn_commit = n_emit;
+        if (ord > 0 && M > 1) oa.update(ord, acc, was_rejected);
+
+        // n_emit token batch[0..n_emit-1] SUDAH masuk state (KV + DeltaNet di-commit langkah berikutnya),
+        // jadi catat semuanya SEBELUM loop emisi yang bisa berhenti lebih awal (EOS / max_tokens).
+        // Versi lama mencatatnya di dalam loop → cached_ids tertinggal dari state → giliran chat berikutnya
+        // memakai ulang state yang salah tanpa error.
+        for (int i = 0; i < n_emit; ++i) eng.cached_ids.push_back(batch[i]);
 
         for (int i = 0; i < n_emit; ++i) {
             int32_t tok = emitted[i];
-            eng.cached_ids.push_back(batch[i]);
             st.tokens.push_back(tok);
             sfx.push(tok);
             nxt = tok;
@@ -1687,12 +1862,13 @@ int main(int argc, char** argv) {
         if (argc < 2) {
             printf("Usage (Direct Zero-Copy ~/models/<dir> OR .taalas2 binary):\n");
             printf("  Profile: %s <model_dir> --profile [--bench 128] [--top-k 4] [--spec 7] [--max-seq 4096]\n", argv[0]);
-            printf("  Daemon:  %s <model_dir> --daemon [--state <baked.tstate>] [--top-k 4] [--spec 7] [--rep-penalty 1.1]\n", argv[0]);
+            printf("  Daemon:  %s <model_dir> --daemon [--state <baked.tstate>] [--top-k 4] [--spec 7] [--rep-penalty 1.0]\n", argv[0]);
+            printf("  Opsi:    --prefill-chunk 32 (1..32; 8 = perilaku lama) --max-seq 4096 --temp 0\n");
             return 1;
         }
         std::string model_path = argv[1], state_path = "";
         bool do_profile = false, daemon_mode = false, willneed = false;
-        int bench_toks = 0, override_topk = 0, max_spec = 7, req_max_seq = 4096;
+        int bench_toks = 0, override_topk = 0, max_spec = 7, req_max_seq = 4096, prefill_chunk = Qwen35Engine::MAX_P;
         SamplingConfig def_sc;
         for (int i = 2; i < argc; ++i) {
             if (strcmp(argv[i], "--profile") == 0) do_profile = true;
@@ -1705,9 +1881,13 @@ int main(int argc, char** argv) {
             else if (strcmp(argv[i], "--state") == 0 && i + 1 < argc) state_path = argv[++i];
             else if (strcmp(argv[i], "--rep-penalty") == 0 && i + 1 < argc) def_sc.rep_pen = atof(argv[++i]);
             else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) def_sc.temperature = atof(argv[++i]);
+            else if (strcmp(argv[i], "--prefill-chunk") == 0 && i + 1 < argc)
+                prefill_chunk = std::min(int(Qwen35Engine::MAX_P), std::max(1, atoi(argv[++i])));
         }
+        if (req_max_seq < 64) { fprintf(stderr, "--max-seq minimal 64\n"); return 1; }
 
         Qwen35Engine eng;
+        eng.prefill_chunk = prefill_chunk;
         if (!eng.load(model_path, override_topk, willneed, req_max_seq)) return 1;
 
         if (!state_path.empty()) {
@@ -1730,14 +1910,37 @@ int main(int argc, char** argv) {
 
         if (bench_toks > 0 && !daemon_mode) {
             eng.reset_states();
-            SparseRepParams rp1{1, eng.vocab, 0, 1.0f, {}};
+            const RepRowsParams rp1{};
             int32_t tok = 9707;
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < bench_toks; ++i) eng.run_step_m(&tok, 1, i, &tok, true, rp1);
             double ms1 = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
             printf("▸ Live Decode Bench (Greedy M=1):         %d toks in %.1f ms => %.1f tok/s\n", bench_toks, ms1, bench_toks * 1000.0 / ms1);
 
+            // Prefill A/B: chunk 8 (perilaku lama) vs chunk aktif, prompt 512 token (token acak; hanya waktu yang diukur)
+            {
+                std::vector<int32_t> pp(512);
+                for (size_t i = 0; i < pp.size(); ++i) pp[i] = int32_t((i * 7919u + 13u) % uint32_t(std::min(eng.vocab, 150000)));
+                for (int ch : {8, eng.prefill_chunk}) {
+                    const int saved = eng.prefill_chunk;
+                    eng.prefill_chunk = ch;
+                    double best = 1e30;
+                    for (int it = 0; it < 2; ++it) {
+                        eng.reset_states(); eng.ram_snap = StateSnapshot{};
+                        int pos = 0; int32_t o = 0;
+                        auto a = std::chrono::high_resolution_clock::now();
+                        eng.prefill_range(pp, 0, pp.size(), pos, true, false, &o, nullptr, nullptr);
+                        best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - a).count());
+                    }
+                    eng.prefill_chunk = saved;
+                    printf("▸ Prefill Bench (512 tok, chunk %2d):      %.1f ms => %.0f tok/s\n", ch, best, 512 * 1000.0 / best);
+                    if (ch == eng.prefill_chunk) break;
+                }
+            }
+
             // Speculative Greedy vs Sampling + Auto System-Prompt Snapshot TTFT Benchmark!
+            // CATATAN: prompt ini pola sintetis (deret angka berulang) → hampir semua draft cocok.
+            // Angka spekulatif di bawah adalah BATAS ATAS; ukur juga di prompt nyata.
             std::vector<int32_t> pattern = {16, 11, 220, 17, 11, 220, 18, 11, 220, 19, 11, 220, 20, 11, 220, 21, 11, 220, 22, 11, 220, 23, 198};
             std::vector<int32_t> prompt;
             for (int r = 0; r < 16; ++r) prompt.insert(prompt.end(), pattern.begin(), pattern.end()); // 368-token prompt
@@ -1752,7 +1955,7 @@ int main(int argc, char** argv) {
             int match = 0, lim = int(std::min(g0.tokens.size(), gs.tokens.size()));
             while (match < lim && g0.tokens[match] == gs.tokens[match]) match++;
             int n_dec = std::max(0, int(gs.tokens.size()) - 1);
-            printf("▸ Live Speculative Bench (Greedy k=%d):    %d toks in %.1f ms => %.1f tok/s (%.2f tok/step, match=%d/%d)\n",
+            printf("▸ Live Speculative Bench (Greedy k=%d, pola sintetis): %d toks in %.1f ms => %.1f tok/s (%.2f tok/step, =greedy %d/%d)\n",
                    max_spec, n_dec, gs.decode_ms, n_dec * 1000.0 / std::max(gs.decode_ms, 0.01),
                    double(n_dec) / std::max(gs.steps, 1), match, lim);
 
@@ -1769,8 +1972,8 @@ int main(int argc, char** argv) {
         }
 
         if (daemon_mode) {
-            printf("{\"ready\":true,\"version\":\"v14\",\"arch\":\"%s\",\"model_dir\":\"%s\",\"top_k\":%d,\"max_spec\":%d,\"baked_toks\":%d}\n",
-                   eng.arch_name.c_str(), eng.model_dir.c_str(), eng.top_k, max_spec, eng.ram_snap.pos);
+            printf("{\"ready\":true,\"version\":\"v15\",\"arch\":\"%s\",\"model_dir\":\"%s\",\"top_k\":%d,\"max_spec\":%d,\"baked_toks\":%d,\"max_seq\":%d,\"prefill_chunk\":%d}\n",
+                   eng.arch_name.c_str(), eng.model_dir.c_str(), eng.top_k, max_spec, eng.ram_snap.pos, eng.max_seq, eng.prefill_chunk);
             fflush(stdout);
             std::string line;
             while (std::getline(std::cin, line)) {
@@ -1784,6 +1987,13 @@ int main(int argc, char** argv) {
                     std::vector<int32_t> pids;
                     for (NSNumber* num in req[@"prompt_ids"]) pids.push_back([num intValue]);
                     std::string out_p = req[@"path"] ? [req[@"path"] UTF8String] : "";
+                    bool bad_bake = false;
+                    for (int32_t t : pids) if (t < 0 || t >= eng.vocab) { bad_bake = true; break; }
+                    if (pids.empty() || bad_bake || int(pids.size()) + 9 > eng.max_seq) {
+                        printf("{\"baked\":false,\"error\":\"prefix %zu token kosong/di luar vocab/melebihi max_seq %d\"}\n", pids.size(), eng.max_seq);
+                        fflush(stdout);
+                        continue;
+                    }
                     auto tb0 = std::chrono::high_resolution_clock::now();
                     eng.reset_states();
                     int pos = 0;
@@ -1812,6 +2022,21 @@ int main(int argc, char** argv) {
                 int mt         = req[@"max_tokens"]  ? [req[@"max_tokens"] intValue]  : 512;
                 int prefix_len = req[@"prefix_len"]  ? [req[@"prefix_len"] intValue]  : 0;
                 int sp_k       = req[@"max_spec"]    ? std::min(7, std::max(0, [req[@"max_spec"] intValue])) : max_spec;
+                if (mt < 1) mt = 1;
+                if (prefix_len < 0 || size_t(prefix_len) >= pids.size()) prefix_len = 0;
+                if (pids.empty() || int(pids.size()) + mt + 9 > eng.max_seq) {
+                    printf("{\"done\":true,\"error\":\"prompt (%zu token) + max_tokens (%d) melebihi max_seq (%d)\",\"tokens\":0}\n",
+                           pids.size(), mt, eng.max_seq);
+                    fflush(stdout);
+                    continue;
+                }
+                bool bad_tok = false;
+                for (int32_t t : pids) if (t < 0 || t >= eng.vocab) { bad_tok = true; break; }
+                if (bad_tok) {
+                    printf("{\"done\":true,\"error\":\"token id di luar vocab\",\"tokens\":0}\n");
+                    fflush(stdout);
+                    continue;
+                }
 
                 SamplingConfig sc = def_sc;
                 if (req[@"temperature"]) sc.temperature = [req[@"temperature"] floatValue];

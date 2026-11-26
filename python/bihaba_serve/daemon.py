@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .detector import ModelInfo, detect_model, scan_models_dir
@@ -33,13 +34,14 @@ class EngineDaemon:
         self,
         model_info: ModelInfo,
         repo_root: Path,
-        rep_penalty: float = 1.05,
+        rep_penalty: float = 1.0,
         enable_thinking: bool = False,
         top_k_moe: int = 0,
         max_spec: int = 7,
         max_seq: int = 4096,
         load_state: str | None = None,
         default_temp: float = 0.0,
+        prefill_chunk: int = 32,
     ):
         self.info = model_info
         self.enable_thinking = enable_thinking
@@ -55,6 +57,7 @@ class EngineDaemon:
             "--rep-penalty", str(rep_penalty),
             "--spec", str(max_spec),
             "--max-seq", str(max_seq),
+            "--prefill-chunk", str(prefill_chunk),
         ]
         if top_k_moe > 0:
             cmd += ["--top-k", str(top_k_moe)]
@@ -75,6 +78,7 @@ class EngineDaemon:
         self.active_top_k = meta.get("top_k", top_k_moe)
         self.max_spec = meta.get("max_spec", max_spec)
         self.baked_toks = meta.get("baked_toks", 0)
+        self.max_seq = int(meta.get("max_seq", max_seq))
 
     def close(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -93,7 +97,10 @@ class EngineDaemon:
         with self.lock:
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
-            res = json.loads(self.proc.stdout.readline())
+            line = self.proc.stdout.readline()
+            if not line:
+                return {"baked": False, "error": "engine berhenti"}
+            res = json.loads(line)
             if res.get("baked"):
                 self.baked_toks = int(res.get("tokens", 0))
             return res
@@ -129,46 +136,70 @@ class EngineDaemon:
         stop_seqs = [s for s in (stop or []) if s]
 
         with self.lock:
+            if self.proc.poll() is not None:
+                yield {"error": "engine tidak berjalan"}
+                return
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
             acc_ids: list[int] = []
             raw_ids: list[int] = []
             emitted_text = ""
             stopped_early = False
-
-            while True:
-                line = self.proc.stdout.readline()
-                if not line:
-                    break
-                obj = json.loads(line)
-                if "tok" in obj:
-                    tid = int(obj["tok"])
-                    raw_ids.append(tid)
-                    if stopped_early or tid in self.tok.eos_ids:
-                        continue
-                    acc_ids.append(tid)
-                    full = self.tok.decode(acc_ids)
-                    if stop_seqs:
-                        for sseq in stop_seqs:
-                            idx = full.find(sseq)
-                            if idx != -1:
-                                delta = full[len(emitted_text):idx]
-                                emitted_text = full[:idx]
-                                if delta:
-                                    yield {"delta": delta}
-                                stopped_early = True
-                                break
-                        if stopped_early:
+            finished = False
+            try:
+                while True:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        finished = True
+                        yield {"error": "engine berhenti di tengah generasi"}
+                        break
+                    obj = json.loads(line)
+                    if "tok" in obj:
+                        tid = int(obj["tok"])
+                        raw_ids.append(tid)
+                        if stopped_early or tid in self.tok.eos_ids:
                             continue
-                    delta = full[len(emitted_text):]
-                    emitted_text = full
-                    if delta:
-                        yield {"delta": delta}
-                elif obj.get("done"):
-                    self.baked_toks = int(obj.get("baked_toks", self.baked_toks))
-                    obj["prompt_tokens"] = len(prompt_ids)
-                    yield {"done": True, "stats": obj, "raw_ids": raw_ids}
-                    break
+                        acc_ids.append(tid)
+                        full = self.tok.decode(acc_ids)
+                        if stop_seqs:
+                            for sseq in stop_seqs:
+                                idx = full.find(sseq)
+                                if idx != -1:
+                                    delta = full[len(emitted_text):idx]
+                                    emitted_text = full[:idx]
+                                    if delta:
+                                        yield {"delta": delta}
+                                    stopped_early = True
+                                    break
+                            if stopped_early:
+                                continue
+                        delta = full[len(emitted_text):]
+                        emitted_text = full
+                        if delta:
+                            yield {"delta": delta}
+                    elif obj.get("done"):
+                        finished = True
+                        if obj.get("error"):
+                            yield {"error": obj["error"]}
+                            break
+                        self.baked_toks = int(obj.get("baked_toks", self.baked_toks))
+                        obj["prompt_tokens"] = len(prompt_ids)
+                        obj["finish_reason"] = "stop" if stopped_early or (raw_ids and raw_ids[-1] in self.tok.eos_ids) \
+                            else ("length" if obj.get("tokens", 0) + 1 >= max_tokens else "stop")
+                        yield {"done": True, "stats": obj, "raw_ids": raw_ids}
+                        break
+            finally:
+                # Klien putus / generator ditutup sebelum engine selesai: buang sisa output sampai baris "done".
+                # Tanpa ini, token sisa terbaca oleh request BERIKUTNYA (respons tercampur).
+                while not finished:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        break
+                    try:
+                        if json.loads(line).get("done"):
+                            break
+                    except ValueError:
+                        break
 
     def stream_tokens(self, messages: list[dict], **kwargs):
         prompt_ids, prefix_len = self.tok.format_chat_with_prefix(messages, enable_thinking=self.enable_thinking)
@@ -188,6 +219,9 @@ class ModelPool:
         self.repo_root = repo_root
         self.daemon_kwargs = daemon_kwargs
         self.pool_lock = threading.Lock()
+        # Satu engine = satu GPU stream. Lock ini dipegang selama swap DAN selama satu request penuh, sehingga
+        # hot-swap tidak bisa menutup daemon yang sedang dipakai request lain (race di versi lama).
+        self.gen_lock = threading.RLock()
         self.catalog: dict[str, ModelInfo] = {}
         self.active: EngineDaemon | None = None
         self.total_requests = 0
@@ -205,8 +239,14 @@ class ModelPool:
         else:
             raise ValueError("Provide either --model <path> or --models-dir <dir> with compatible models.")
 
+    @contextmanager
+    def session(self, requested_model: str | None = None):
+        """Pakai: `with pool.session(model) as daemon: ...` — aman terhadap hot-swap bersamaan."""
+        with self.gen_lock:
+            yield self.get_daemon(requested_model)
+
     def get_daemon(self, requested_model: str | None = None) -> EngineDaemon:
-        with self.pool_lock:
+        with self.gen_lock, self.pool_lock:
             self.total_requests += 1
             if not requested_model or (self.active and requested_model == self.active.model_name):
                 return self.active

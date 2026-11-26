@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import struct
 from pathlib import Path
 
@@ -16,7 +17,16 @@ def align_model_dir(model_dir: str | Path) -> None:
         print(f"No .safetensors files in {p}")
         return
     print(f"▸ Aligning {p.name} ({len(shards)} shards)...")
-    for fp in shards:
+    for link in shards:
+        # Cache HuggingFace: *.safetensors adalah symlink ke blobs/<hash>. Versi lama mengganti symlink dengan
+        # file baru → blob lama tetap ada (disk 2×) dan cache rusak. Sekarang yang di-pad adalah target aslinya.
+        fp = link.resolve()
+        if link.is_symlink():
+            print(f"  ↪ {link.name} adalah symlink → menulis ke target {fp.name} (cache HF tetap utuh)")
+        free = shutil.disk_usage(fp.parent).free
+        if free < fp.stat().st_size + (64 << 20):
+            print(f"  ✗ {link.name}: ruang disk kurang ({free >> 30} GB bebas, butuh ~{fp.stat().st_size >> 30} GB sementara) — dilewati")
+            continue
         with fp.open("rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
             data_off = 8 + hlen
@@ -27,7 +37,7 @@ def align_model_dir(model_dir: str | Path) -> None:
             pad = 64 - rem
             hdr = f.read(hlen)
             json.loads(hdr)
-            tmp = fp.with_suffix(".safetensors.align_tmp")
+            tmp = fp.with_name(fp.name + ".align_tmp")
             with tmp.open("wb") as out:
                 out.write(struct.pack("<Q", hlen + pad))
                 out.write(hdr)
@@ -38,4 +48,4 @@ def align_model_dir(model_dir: str | Path) -> None:
                         break
                     out.write(buf)
         os.replace(tmp, fp)
-        print(f"  ✓ {fp.name}: padded +{pad}B -> data_off={data_off + pad} (64B-aligned)")
+        print(f"  ✓ {link.name}: padded +{pad}B -> data_off={data_off + pad} (64B-aligned)")

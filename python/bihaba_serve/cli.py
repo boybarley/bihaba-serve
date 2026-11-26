@@ -60,12 +60,19 @@ def _run_chat(daemon: EngineDaemon, max_tokens: int, system_text: str | None) ->
         transcript_ids.extend(asst_hdr)
 
         print("AI > ", end="", flush=True)
-        stats, raw_ids = {}, []
+        stats, raw_ids, err = {}, [], None
+        turn_start = len(transcript_ids) - len(asst_hdr) - len(daemon.tok.encode_raw(f"<|im_start|>user\n{user_msg}<|im_end|>\n"))
         for ev in daemon.stream_prompt_ids(transcript_ids, prefix_len=prefix_len, max_tokens=max_tokens):
             if "delta" in ev:
                 print(ev["delta"], end="", flush=True)
+            elif "error" in ev:
+                err = ev["error"]
             elif ev.get("done"):
                 stats, raw_ids = ev["stats"], ev["raw_ids"]
+        if err:
+            transcript_ids = transcript_ids[:max(prefix_len, turn_start)]
+            print(f"\n   ✗ {err} — ketik /clear untuk memulai percakapan baru.")
+            continue
 
         transcript_ids.extend([t for t in raw_ids if t not in daemon.tok.eos_ids])
         transcript_ids.extend(im_end_nl)
@@ -90,12 +97,19 @@ def main() -> None:
     p_srv.add_argument("--spec", type=int, default=7, help="Max speculative draft tokens (0..7)")
     p_srv.add_argument("--max-seq", type=int, default=4096)
     p_srv.add_argument("--temp", type=float, default=0.6)
-    p_srv.add_argument("--rep-penalty", type=float, default=1.05)
+    p_srv.add_argument("--rep-penalty", type=float, default=1.0,
+                       help="1.0 = mati (default). >1 merusak kode/JSON & menurunkan penerimaan spekulasi")
+    p_srv.add_argument("--prefill-chunk", type=int, default=32, help="Token per langkah prefill (1..32; 8 = perilaku lama)")
     p_srv.add_argument("--thinking", action="store_true")
     p_srv.add_argument("--system-file", default=None, help="Pre-bake system prompt into GPU RAM on startup")
     p_srv.add_argument("--load-state", default=None, help="Preload baked .tstate snapshot on startup (0ms TTFT)")
-    p_srv.add_argument("--host", default="0.0.0.0")
+    p_srv.add_argument("--host", default="127.0.0.1",
+                       help="Default hanya lokal. Pakai 0.0.0.0 untuk membuka ke jaringan (wajib --api-key)")
     p_srv.add_argument("--port", type=int, default=8090)
+    p_srv.add_argument("--api-key", default=os.environ.get("BIHABA_API_KEY"),
+                       help="Wajibkan 'Authorization: Bearer <key>' (atau env BIHABA_API_KEY)")
+    p_srv.add_argument("--cors", default=None, help="Aktifkan CORS untuk origin ini, mis. '*' atau 'http://localhost:3000'")
+    p_srv.add_argument("--state-dir", default=None, help="Folder tempat POST /v1/state/bake boleh menyimpan .tstate")
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat")
     p_chat.add_argument("--model", required=True)
@@ -103,7 +117,8 @@ def main() -> None:
     p_chat.add_argument("--spec", type=int, default=7)
     p_chat.add_argument("--max-seq", type=int, default=4096)
     p_chat.add_argument("--temp", type=float, default=0.6)
-    p_chat.add_argument("--rep-penalty", type=float, default=1.05)
+    p_chat.add_argument("--rep-penalty", type=float, default=1.0)
+    p_chat.add_argument("--prefill-chunk", type=int, default=32)
     p_chat.add_argument("--thinking", action="store_true")
     p_chat.add_argument("--max-tokens", type=int, default=512)
     p_chat.add_argument("--system-file", default=None)
@@ -115,6 +130,7 @@ def main() -> None:
     p_b.add_argument("--spec", type=int, default=7)
     p_b.add_argument("--tokens", type=int, default=128)
     p_b.add_argument("--profile", action="store_true")
+    p_b.add_argument("--prefill-chunk", type=int, default=32)
 
     p_bk = sub.add_parser("bake", help="Bake a system prompt / RAG prefix into a persistent .tstate file")
     p_bk.add_argument("--model", required=True)
@@ -150,7 +166,8 @@ def main() -> None:
     if args.cmd == "bench":
         info = detect_model(args.model)
         bin_path = find_engine_binary(info.engine, repo)
-        cmd = [str(bin_path), str(info.path), "--bench", str(args.tokens), "--spec", str(args.spec)]
+        cmd = [str(bin_path), str(info.path), "--bench", str(args.tokens), "--spec", str(args.spec),
+               "--prefill-chunk", str(args.prefill_chunk)]
         if args.profile:
             cmd.append("--profile")
         if args.top_k > 0:
@@ -163,6 +180,8 @@ def main() -> None:
         daemon = EngineDaemon(info, repo, top_k_moe=args.top_k)
         try:
             res = daemon.bake_system_prompt(sys_text, args.out)
+            if not res.get("baked"):
+                sys.exit(f"✗ Bake gagal: {res.get('error', res)}")
             print(f"✓ Baked state saved to {args.out}: {res}")
         finally:
             daemon.close()
@@ -174,7 +193,7 @@ def main() -> None:
         daemon = EngineDaemon(
             info, repo, rep_penalty=args.rep_penalty, enable_thinking=args.thinking,
             top_k_moe=args.top_k, max_spec=args.spec, max_seq=args.max_seq,
-            load_state=args.load_state, default_temp=args.temp,
+            load_state=args.load_state, default_temp=args.temp, prefill_chunk=args.prefill_chunk,
         )
         try:
             _run_chat(daemon, args.max_tokens, sys_text)
@@ -188,13 +207,13 @@ def main() -> None:
             repo, default_model=args.model, models_dir=args.models_dir,
             rep_penalty=args.rep_penalty, enable_thinking=args.thinking,
             top_k_moe=args.top_k, max_spec=args.spec, max_seq=args.max_seq,
-            load_state=args.load_state, default_temp=args.temp,
+            load_state=args.load_state, default_temp=args.temp, prefill_chunk=args.prefill_chunk,
         )
         if sys_text and not args.load_state and pool.active:
             res = pool.active.bake_system_prompt(sys_text, None)
             print(f"✓ Pre-baked --system-file into GPU RAM snapshot: {res}")
         try:
-            run_server(pool, args.host, args.port)
+            run_server(pool, args.host, args.port, api_key=args.api_key, cors_origin=args.cors, state_dir=args.state_dir)
         except KeyboardInterrupt:
             print("\nShutting down bihaba-serve...")
         finally:

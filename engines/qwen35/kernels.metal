@@ -29,7 +29,6 @@ struct QKNormRopeParams { int M, n_heads, n_kv_heads, head_dim, rope_dim, pos, m
 struct GQA256Params     { int M, n_heads, n_kv_heads, pos, max_seq; };
 struct TopKParams       { int M, E, top_k; };
 struct MoEProjParams    { int M, K, N, top_k, gs_shift; ulong stride_w, stride_s; };
-struct SparseRepParams  { int M, K_len, n_slots; float penalty; int slots[64]; };
 struct DeltaNetInParams { int M, K, gs_shift, n_qkv, n_z, n_a, n_b; };
 struct FullQKVParams    { int M, K, gs_shift, n_q, n_k, n_v; };
 
@@ -727,7 +726,10 @@ kernel void q35_qkv_proj_4b_m1(
     if (lane == 0) { op[r0] = half(v0); if (lr0 + 1 < stride) op[r1] = half(v1); }
 }
 
-// ─────────────────────── 4F. BM=8, BN=32, BK=64 Compact-Half Hardware MMA (4-Byte Safe!) ───────────────────────
+// ─────────────────────── 4F. BM=8·MT, BN=32, BK=64 Compact-Half Hardware MMA ───────────────────────
+// MT = jumlah tile 8-token. MT=1: verifikasi spekulatif M=4..8. MT=4: prefill M=9..32.
+// Tile bobot (32 baris × 64 K) di-dekuantisasi SEKALI ke threadgroup memory lalu dipakai untuk semua
+// MT tile token — inilah yang membuat prefill 32 token hanya sedikit lebih mahal dari 8 token.
 inline void dequant_4bit_to_tg(const uint32_t wv, const half2 hs, const half2 hb, threadgroup half* dst) {
     const half2 c1024 = half2(1024.0h);
     const half2 p0 = fma(hs, as_type<half2>(( wv        & 0x000F000Fu) | 0x64006400u) - c1024, hb);
@@ -754,8 +756,39 @@ inline void dequant_2bit_to_tg(const uint32_t wv, const half2 hs, const half2 hb
     *((threadgroup half4*)(dst + 12)) = half4(p4.y, p5.y, p6.y, p7.y);
 }
 
+// Muat tile token X[0..8·MT, k0..k0+64] ke Xs (baris di luar M diisi nol)
+template <int MT>
+inline void load_x_tile(device const half* x, int M, int K, int k0, threadgroup half* Xs, uint tid) {
+    const int xm = int(tid) >> 4, xk = (int(tid) & 15) * 4;
+    #pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        const int m = xm + 8 * t;
+        *((threadgroup half4*)(Xs + m * 64 + xk)) = (m < M)
+            ? *((const device half4*)(x + m * K + k0 + xk)) : half4(0.0h);
+    }
+}
+
+// Dekuantisasi tile bobot 32 baris × 64 K (4 thread per baris, 16 nilai per thread)
 template <int BITS>
-inline void qmm_bm8_bk64_impl(
+inline void load_w_tile(device const uint32_t* w, device const ushort* scales, device const ushort* biases,
+                        int r, int K, int KG, int gsh, int k0, threadgroup half* Ws, uint tid) {
+    constexpr int WS = 72;
+    const int r_off = int(tid) >> 2, wi = int(tid) & 3;
+    const ulong s_off = ulong(r) * ulong(KG) + ulong((k0 + wi * 16) >> gsh);
+    const half2 hs = half2(load_sb_h(scales, s_off));
+    const half2 hb = half2(load_sb_h(biases, s_off));
+    threadgroup half* w_dst = Ws + r_off * WS + wi * 16;
+    if (BITS == 4) {
+        const ulong w_idx = ulong(r) * ulong(K >> 3) + ulong((k0 >> 3) + wi * 2);
+        dequant_4bit_to_tg(w[w_idx],     hs, hb, w_dst);
+        dequant_4bit_to_tg(w[w_idx + 1], hs, hb, w_dst + 8);
+    } else {
+        dequant_2bit_to_tg(w[ulong(r) * ulong(K >> 4) + ulong((k0 >> 4) + wi)], hs, hb, w_dst);
+    }
+}
+
+template <int BITS, int MT>
+inline void qmm_bk64_impl(
     device const half* x, device const uint32_t* w, device const ushort* scales, device const ushort* biases,
     device half* out, QMVMultiParams p,
     threadgroup half* Xs, threadgroup half* Ws, threadgroup float* Cs,
@@ -765,127 +798,122 @@ inline void qmm_bm8_bk64_impl(
     const int M = p.M, K = p.K, N = p.N, gsh = p.gs_shift;
     const int KG = K >> gsh;
     const int row_base = int(tg_x) * 32;
+    const int r = min(row_base + (int(tid) >> 2), N - 1);
 
-    simdgroup_float8x8 c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    const int xm = int(tid) >> 4, xk = (int(tid) & 15) * 4;
-    const int r_off = int(tid) >> 2, wi = int(tid) & 3;
-    const int r = min(row_base + r_off, N - 1);
+    simdgroup_float8x8 c[MT];
+    #pragma unroll
+    for (int t = 0; t < MT; ++t) c[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
+    const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
     for (int k0 = 0; k0 < K; k0 += BK) {
-        *((threadgroup half4*)(Xs + xm * BK + xk)) = (xm < M)
-            ? *((const device half4*)(x + xm * K + k0 + xk)) : half4(0.0h);
-
-        const int g_idx = (k0 + wi * 16) >> gsh;
-        const ulong s_off = ulong(r) * ulong(KG) + ulong(g_idx);
-        const half2 hs = half2(load_sb_h(scales, s_off));
-        const half2 hb = half2(load_sb_h(biases, s_off));
-        threadgroup half* w_dst = Ws + r_off * WS + wi * 16;
-        if (BITS == 4) {
-            const ulong w_idx = ulong(r) * ulong(K >> 3) + ulong((k0 >> 3) + wi * 2);
-            dequant_4bit_to_tg(w[w_idx],     hs, hb, w_dst);
-            dequant_4bit_to_tg(w[w_idx + 1], hs, hb, w_dst + 8);
-        } else {
-            const uint32_t wv = w[ulong(r) * ulong(K >> 4) + ulong((k0 >> 4) + wi)];
-            dequant_2bit_to_tg(wv, hs, hb, w_dst);
-        }
+        load_x_tile<MT>(x, M, K, k0, Xs, tid);
+        load_w_tile<BITS>(w, scales, biases, r, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt, a0;
+            simdgroup_half8x8 bt;
             simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            simdgroup_load(a0, Xs + kk, BK);
-            simdgroup_multiply_accumulate(c0, a0, bt, c0);
+            #pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (t * 8 < M) {
+                    simdgroup_half8x8 a;
+                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
+                    simdgroup_multiply_accumulate(c[t], a, bt, c[t]);
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup float* cbuf = Cs + int(sg) * 64;
     const int n_base = row_base + int(sg) * 8;
-    simdgroup_store(c0, cbuf, 8);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (int t = 0; t < 2; ++t) {
-        const int idx = int(lane) * 2 + t, m = idx >> 3, col = n_base + (idx & 7);
-        if (m < M && col < N) {
-            if (ADD_RES_C) out[m * N + col] += half(cbuf[idx]);
-            else           out[m * N + col]  = half(cbuf[idx]);
+    #pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (t * 8 >= M) break;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(c[t], cbuf, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int q = 0; q < 2; ++q) {
+            const int idx = int(lane) * 2 + q, m = t * 8 + (idx >> 3), col = n_base + (idx & 7);
+            if (m < M && col < N) {
+                if (ADD_RES_C) out[m * N + col] += half(cbuf[idx]);
+                else           out[m * N + col]  = half(cbuf[idx]);
+            }
         }
     }
 }
 
-kernel void qmm_4b_mma8(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]],
-    device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]],
-    constant QMVMultiParams& p [[buffer(5)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64];
-    qmm_bm8_bk64_impl<4>(x, w, s, b, out, p, Xs, Ws, Cs, tg_x, tid, sg, lane);
+#define DECL_QMM(NAME, BITS, MT) \
+kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
+    device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
+    constant QMVMultiParams& p [[buffer(5)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64]; \
+    qmm_bk64_impl<BITS, MT>(x, w, s, b, out, p, Xs, Ws, Cs, tg_x, tid, sg, lane); \
 }
+DECL_QMM(qmm_4b_mma8, 4, 1)
+DECL_QMM(qmm_2b_mma8, 2, 1)
+DECL_QMM(qmm_4b_mmaP, 4, 4)
+DECL_QMM(qmm_2b_mmaP, 2, 4)
 
-kernel void qmm_2b_mma8(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]],
-    device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]],
-    constant QMVMultiParams& p [[buffer(5)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64];
-    qmm_bm8_bk64_impl<2>(x, w, s, b, out, p, Xs, Ws, Cs, tg_x, tid, sg, lane);
+#define DECL_DN_IN_MMA(NAME, MT) \
+kernel void NAME( \
+    device const half* x [[buffer(0)]], \
+    device const uint32_t* w_qkv [[buffer(1)]], device const ushort* s_qkv [[buffer(2)]], device const ushort* b_qkv [[buffer(3)]], \
+    device const uint32_t* w_z   [[buffer(4)]], device const ushort* s_z   [[buffer(5)]], device const ushort* b_z   [[buffer(6)]], \
+    device const uint32_t* w_a   [[buffer(7)]], device const ushort* s_a   [[buffer(8)]], device const ushort* b_a   [[buffer(9)]], \
+    device const uint32_t* w_b   [[buffer(10)]],device const ushort* s_b   [[buffer(11)]],device const ushort* b_b   [[buffer(12)]], \
+    device half* o_qkv [[buffer(13)]], device half* o_z [[buffer(14)]], device half* o_a [[buffer(15)]], device half* o_b [[buffer(16)]], \
+    constant DeltaNetInParams& p [[buffer(17)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    const int g_base = int(tg_x) * 32; \
+    const int c0 = p.n_qkv, c1 = c0 + p.n_z, c2 = c1 + p.n_a, c3 = c2 + p.n_b; \
+    if (g_base >= c3) return; \
+    device const uint32_t* wp; device const ushort *sp, *bp; device half* op; \
+    int row_base, N; \
+    if (g_base < c0)      { wp = w_qkv; sp = s_qkv; bp = b_qkv; op = o_qkv; row_base = g_base;      N = p.n_qkv; } \
+    else if (g_base < c1) { wp = w_z;   sp = s_z;   bp = b_z;   op = o_z;   row_base = g_base - c0; N = p.n_z;   } \
+    else if (g_base < c2) { wp = w_a;   sp = s_a;   bp = b_a;   op = o_a;   row_base = g_base - c1; N = p.n_a;   } \
+    else                  { wp = w_b;   sp = s_b;   bp = b_b;   op = o_b;   row_base = g_base - c2; N = p.n_b;   } \
+    threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64]; \
+    QMVMultiParams mp{p.M, p.K, N, p.gs_shift}; \
+    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane); \
 }
+DECL_DN_IN_MMA(deltanet_in_proj_4b_mma8, 1)
+DECL_DN_IN_MMA(deltanet_in_proj_4b_mmaP, 4)
 
-kernel void deltanet_in_proj_4b_mma8(
-    device const half* x [[buffer(0)]],
-    device const uint32_t* w_qkv [[buffer(1)]], device const ushort* s_qkv [[buffer(2)]], device const ushort* b_qkv [[buffer(3)]],
-    device const uint32_t* w_z   [[buffer(4)]], device const ushort* s_z   [[buffer(5)]], device const ushort* b_z   [[buffer(6)]],
-    device const uint32_t* w_a   [[buffer(7)]], device const ushort* s_a   [[buffer(8)]], device const ushort* b_a   [[buffer(9)]],
-    device const uint32_t* w_b   [[buffer(10)]],device const ushort* s_b   [[buffer(11)]],device const ushort* b_b   [[buffer(12)]],
-    device half* o_qkv [[buffer(13)]], device half* o_z [[buffer(14)]], device half* o_a [[buffer(15)]], device half* o_b [[buffer(16)]],
-    constant DeltaNetInParams& p [[buffer(17)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    const int g_base = int(tg_x) * 32;
-    const int c0 = p.n_qkv, c1 = c0 + p.n_z, c2 = c1 + p.n_a, c3 = c2 + p.n_b;
-    if (g_base >= c3) return;
-    device const uint32_t* wp; device const ushort *sp, *bp; device half* op;
-    int row_base, N;
-    if (g_base < c0)      { wp = w_qkv; sp = s_qkv; bp = b_qkv; op = o_qkv; row_base = g_base;      N = p.n_qkv; }
-    else if (g_base < c1) { wp = w_z;   sp = s_z;   bp = b_z;   op = o_z;   row_base = g_base - c0; N = p.n_z;   }
-    else if (g_base < c2) { wp = w_a;   sp = s_a;   bp = b_a;   op = o_a;   row_base = g_base - c1; N = p.n_a;   }
-    else                  { wp = w_b;   sp = s_b;   bp = b_b;   op = o_b;   row_base = g_base - c2; N = p.n_b;   }
-
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64];
-    QMVMultiParams mp{p.M, p.K, N, p.gs_shift};
-    qmm_bm8_bk64_impl<4>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane);
+#define DECL_QKV_MMA(NAME, MT) \
+kernel void NAME( \
+    device const half* x [[buffer(0)]], \
+    device const uint32_t* w_q [[buffer(1)]], device const ushort* s_q [[buffer(2)]], device const ushort* b_q [[buffer(3)]], \
+    device const uint32_t* w_k [[buffer(4)]], device const ushort* s_k [[buffer(5)]], device const ushort* b_k [[buffer(6)]], \
+    device const uint32_t* w_v [[buffer(7)]], device const ushort* s_v [[buffer(8)]], device const ushort* b_v [[buffer(9)]], \
+    device half* o_q [[buffer(10)]], device half* o_k [[buffer(11)]], device half* o_v [[buffer(12)]], \
+    constant FullQKVParams& p [[buffer(13)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    const int g_base = int(tg_x) * 32; \
+    const int c0 = p.n_q, c1 = c0 + p.n_k, c2 = c1 + p.n_v; \
+    if (g_base >= c2) return; \
+    device const uint32_t* wp; device const ushort *sp, *bp; device half* op; \
+    int row_base, N; \
+    if (g_base < c0)      { wp = w_q; sp = s_q; bp = b_q; op = o_q; row_base = g_base;      N = p.n_q; } \
+    else if (g_base < c1) { wp = w_k; sp = s_k; bp = b_k; op = o_k; row_base = g_base - c0; N = p.n_k; } \
+    else                  { wp = w_v; sp = s_v; bp = b_v; op = o_v; row_base = g_base - c1; N = p.n_v; } \
+    threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64]; \
+    QMVMultiParams mp{p.M, p.K, N, p.gs_shift}; \
+    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane); \
 }
+DECL_QKV_MMA(q35_qkv_proj_4b_mma8, 1)
+DECL_QKV_MMA(q35_qkv_proj_4b_mmaP, 4)
 
-kernel void q35_qkv_proj_4b_mma8(
-    device const half* x [[buffer(0)]],
-    device const uint32_t* w_q [[buffer(1)]], device const ushort* s_q [[buffer(2)]], device const ushort* b_q [[buffer(3)]],
-    device const uint32_t* w_k [[buffer(4)]], device const ushort* s_k [[buffer(5)]], device const ushort* b_k [[buffer(6)]],
-    device const uint32_t* w_v [[buffer(7)]], device const ushort* s_v [[buffer(8)]], device const ushort* b_v [[buffer(9)]],
-    device half* o_q [[buffer(10)]], device half* o_k [[buffer(11)]], device half* o_v [[buffer(12)]],
-    constant FullQKVParams& p [[buffer(13)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    const int g_base = int(tg_x) * 32;
-    const int c0 = p.n_q, c1 = c0 + p.n_k, c2 = c1 + p.n_v;
-    if (g_base >= c2) return;
-    device const uint32_t* wp; device const ushort *sp, *bp; device half* op;
-    int row_base, N;
-    if (g_base < c0)      { wp = w_q; sp = s_q; bp = b_q; op = o_q; row_base = g_base;      N = p.n_q; }
-    else if (g_base < c1) { wp = w_k; sp = s_k; bp = b_k; op = o_k; row_base = g_base - c0; N = p.n_k; }
-    else                  { wp = w_v; sp = s_v; bp = b_v; op = o_v; row_base = g_base - c1; N = p.n_v; }
-
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64];
-    QMVMultiParams mp{p.M, p.K, N, p.gs_shift};
-    qmm_bm8_bk64_impl<4>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane);
-}
-
-template <int BITS>
-inline void swiglu_bm8_bk64_impl(
+template <int BITS, int MT>
+inline void swiglu_bk64_impl(
     device const half* x,
     device const uint32_t* wg, device const ushort* sg_a, device const ushort* bg_a,
     device const uint32_t* wu, device const ushort* su_a, device const ushort* bu_a,
@@ -896,61 +924,49 @@ inline void swiglu_bm8_bk64_impl(
     constexpr int BK = 64, WS = 72;
     const int M = p.M, K = p.K, N = p.N, gsh = p.gs_shift, KG = K >> gsh;
     const int row_base = int(tg_x) * 32;
+    const int r = min(row_base + (int(tid) >> 2), N - 1);
 
-    simdgroup_float8x8 cg = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_float8x8 cu = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    const int xm = int(tid) >> 4, xk = (int(tid) & 15) * 4;
-    const int r_off = int(tid) >> 2, wi = int(tid) & 3;
-    const int r = min(row_base + r_off, N - 1);
+    simdgroup_float8x8 cg[MT], cu[MT];
+    #pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        cg[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        cu[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        *((threadgroup half4*)(Xs + xm * BK + xk)) = (xm < M)
-            ? *((const device half4*)(x + xm * K + k0 + xk)) : half4(0.0h);
-
-        const int g_idx = (k0 + wi * 16) >> gsh;
-        const ulong s_off = ulong(r) * ulong(KG) + ulong(g_idx);
-        threadgroup half* w_dst = Ws + r_off * WS + wi * 16;
-        const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
-
-        {
-            const half2 hs = half2(load_sb_h(sg_a, s_off)), hb = half2(load_sb_h(bg_a, s_off));
-            if (BITS == 4) {
-                const ulong w_idx = ulong(r) * ulong(K >> 3) + ulong((k0 >> 3) + wi * 2);
-                dequant_4bit_to_tg(wg[w_idx],     hs, hb, w_dst);
-                dequant_4bit_to_tg(wg[w_idx + 1], hs, hb, w_dst + 8);
-            } else {
-                const uint32_t wv = wg[ulong(r) * ulong(K >> 4) + ulong((k0 >> 4) + wi)];
-                dequant_2bit_to_tg(wv, hs, hb, w_dst);
-            }
-        }
+        load_x_tile<MT>(x, M, K, k0, Xs, tid);
+        load_w_tile<BITS>(wg, sg_a, bg_a, r, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt, a0;
+            simdgroup_half8x8 bt;
             simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            simdgroup_load(a0, Xs + kk, BK);
-            simdgroup_multiply_accumulate(cg, a0, bt, cg);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        {
-            const half2 hs = half2(load_sb_h(su_a, s_off)), hb = half2(load_sb_h(bu_a, s_off));
-            if (BITS == 4) {
-                const ulong w_idx = ulong(r) * ulong(K >> 3) + ulong((k0 >> 3) + wi * 2);
-                dequant_4bit_to_tg(wu[w_idx],     hs, hb, w_dst);
-                dequant_4bit_to_tg(wu[w_idx + 1], hs, hb, w_dst + 8);
-            } else {
-                const uint32_t wv = wu[ulong(r) * ulong(K >> 4) + ulong((k0 >> 4) + wi)];
-                dequant_2bit_to_tg(wv, hs, hb, w_dst);
+            #pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (t * 8 < M) {
+                    simdgroup_half8x8 a;
+                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
+                    simdgroup_multiply_accumulate(cg[t], a, bt, cg[t]);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        load_w_tile<BITS>(wu, su_a, bu_a, r, K, KG, gsh, k0, Ws, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         #pragma unroll
         for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt, a0;
+            simdgroup_half8x8 bt;
             simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            simdgroup_load(a0, Xs + kk, BK);
-            simdgroup_multiply_accumulate(cu, a0, bt, cu);
+            #pragma unroll
+            for (int t = 0; t < MT; ++t) {
+                if (t * 8 < M) {
+                    simdgroup_half8x8 a;
+                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
+                    simdgroup_multiply_accumulate(cu[t], a, bt, cu[t]);
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -958,39 +974,38 @@ inline void swiglu_bm8_bk64_impl(
     threadgroup float* gbuf = Cg_s + int(sg) * 64;
     threadgroup float* ubuf = Cu_s + int(sg) * 64;
     const int n_base = row_base + int(sg) * 8;
-    simdgroup_store(cg, gbuf, 8);
-    simdgroup_store(cu, ubuf, 8);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    for (int t = 0; t < 2; ++t) {
-        const int idx = int(lane) * 2 + t, m = idx >> 3, col = n_base + (idx & 7);
-        if (m < M && col < N) {
-            const float gv = gbuf[idx];
-            out[m * N + col] = half((gv / (1.0f + exp(-gv))) * ubuf[idx]);
+    #pragma unroll
+    for (int t = 0; t < MT; ++t) {
+        if (t * 8 >= M) break;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(cg[t], gbuf, 8);
+        simdgroup_store(cu[t], ubuf, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int q = 0; q < 2; ++q) {
+            const int idx = int(lane) * 2 + q, m = t * 8 + (idx >> 3), col = n_base + (idx & 7);
+            if (m < M && col < N) {
+                const float gv = gbuf[idx];
+                out[m * N + col] = half((gv / (1.0f + exp(-gv))) * ubuf[idx]);
+            }
         }
     }
 }
 
-kernel void dense_swiglu_4b_mma8(device const half* x [[buffer(0)]],
-    device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]],
-    device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]],
-    device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cg_s[4 * 64], Cu_s[4 * 64];
-    swiglu_bm8_bk64_impl<4>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, Xs, Ws, Cg_s, Cu_s, tg_x, tid, sg, lane);
+#define DECL_SWIG_MMA(NAME, BITS, MT) \
+kernel void NAME(device const half* x [[buffer(0)]], \
+    device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
+    device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
+    device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cg_s[4 * 64], Cu_s[4 * 64]; \
+    swiglu_bk64_impl<BITS, MT>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, Xs, Ws, Cg_s, Cu_s, tg_x, tid, sg, lane); \
 }
-
-kernel void dense_swiglu_2b_mma8(device const half* x [[buffer(0)]],
-    device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]],
-    device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]],
-    device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]],
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
-{
-    threadgroup half Xs[8 * 64], Ws[32 * 72]; threadgroup float Cg_s[4 * 64], Cu_s[4 * 64];
-    swiglu_bm8_bk64_impl<2>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, Xs, Ws, Cg_s, Cu_s, tg_x, tid, sg, lane);
-}
+DECL_SWIG_MMA(dense_swiglu_4b_mma8, 4, 1)
+DECL_SWIG_MMA(dense_swiglu_2b_mma8, 2, 1)
+DECL_SWIG_MMA(dense_swiglu_4b_mmaP, 4, 4)
+DECL_SWIG_MMA(dense_swiglu_2b_mmaP, 2, 4)
 
 // ─────────────────────── 5. Zero-Copy Speculative Chunked DeltaNet (M=1 & M=2..8 + Delayed Commit) ───────────────────────
 kernel void deltanet_conv1d_silu_m1(
@@ -1184,6 +1199,116 @@ kernel void deltanet_recurrent_spec(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// ─────────────────────── 5B. Prefill DeltaNet (M bebas, state langsung diperbarui) ───────────────────────
+// Prefill tidak butuh rollback: state diperbarui token demi token di dalam SATU dispatch, dengan urutan
+// operasi yang sama persis dengan jalur M=1 (deltanet_recurrent_m1) → hasil identik dengan decode satu-satu.
+// Baris state S (v_hd × k_hd float) disimpan di register selama seluruh chunk: dibaca & ditulis sekali.
+kernel void deltanet_conv1d_silu_prefill(
+    device half* qkv [[buffer(0)]], device half* conv_state [[buffer(1)]],
+    device const half* conv_w [[buffer(2)]], constant Conv1dParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int c = int(gid);
+    if (c >= p.C) return;
+    float w0 = float(conv_state[0 * p.C + c]);
+    float w1 = float(conv_state[1 * p.C + c]);
+    float w2 = float(conv_state[2 * p.C + c]);
+    const float cw0 = float(conv_w[c * 4 + 0]), cw1 = float(conv_w[c * 4 + 1]);
+    const float cw2 = float(conv_w[c * 4 + 2]), cw3 = float(conv_w[c * 4 + 3]);
+    for (int m = 0; m < p.M; ++m) {
+        const int idx = m * p.C + c;
+        const float x = float(qkv[idx]);
+        const float y = w0 * cw0 + w1 * cw1 + w2 * cw2 + x * cw3;
+        qkv[idx] = half(y / (1.0f + exp(-y)));
+        w0 = w1; w1 = w2; w2 = x;
+    }
+    conv_state[0 * p.C + c] = half(w0);
+    conv_state[1 * p.C + c] = half(w1);
+    conv_state[2 * p.C + c] = half(w2);
+}
+
+kernel void deltanet_recurrent_prefill(
+    device const half* qkv [[buffer(0)]], device const half* z_buf [[buffer(1)]],
+    device const half* a_buf [[buffer(2)]], device const half* b_buf [[buffer(3)]],
+    device const float* A_log [[buffer(4)]], device const float* dt_bias [[buffer(5)]],
+    device const half* norm_w [[buffer(6)]], device float* S_state [[buffer(7)]],
+    device half* out [[buffer(8)]], constant DeltaNetParams& p [[buffer(9)]],
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    const int hv = int(tg_x);
+    if (hv >= p.n_vh) return;
+    const int rep = p.n_vh / p.n_kh, hk = hv / rep;
+    const int k_dim = p.n_kh * p.k_hd, v_dim = p.n_vh * p.v_hd, qkv_stride = 2 * k_dim + v_dim;
+
+    threadgroup float q_s[128], k_s[128], y_s[128], sm_ss[8];
+
+    const int col4 = int(lane) * 4;
+    device float4* S_head = (device float4*)(S_state + ulong(hv) * ulong(p.v_hd * p.k_hd));
+    const int stride4 = p.k_hd >> 2;
+    const int nrows = (p.v_hd - int(sg) + 7) >> 3;      // baris vi = sg + 8j, j < nrows (≤ 16)
+
+    float4 sv[16];
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) if (j < nrows) sv[j] = S_head[(int(sg) + 8 * j) * stride4 + lane];
+
+    for (int m = 0; m < p.M; ++m) {
+        const device half* q_ptr = qkv + m * qkv_stride + hk * p.k_hd;
+        const device half* k_ptr = qkv + m * qkv_stride + k_dim + hk * p.k_hd;
+        const device half* v_ptr = qkv + m * qkv_stride + 2 * k_dim + hv * p.v_hd;
+
+        float qv_t = (int(tid) < p.k_hd) ? float(q_ptr[tid]) : 0.0f;
+        float kv_t = (int(tid) < p.k_hd) ? float(k_ptr[tid]) : 0.0f;
+        float q_ss = simd_sum(qv_t * qv_t), k_ss = simd_sum(kv_t * kv_t);
+        if (lane == 0) sm_ss[sg] = q_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float q_inv = rsqrt(sm_ss[0] + sm_ss[1] + sm_ss[2] + sm_ss[3] + 1e-6f) * rsqrt(float(p.k_hd));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) sm_ss[sg] = k_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float k_inv = rsqrt(sm_ss[0] + sm_ss[1] + sm_ss[2] + sm_ss[3] + 1e-6f);
+        if (int(tid) < p.k_hd) { q_s[tid] = qv_t * q_inv; k_s[tid] = kv_t * k_inv; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float sp_in = float(a_buf[m * p.n_vh + hv]) + dt_bias[hv];
+        const float sp    = (sp_in > 20.0f) ? sp_in : log(1.0f + exp(sp_in));
+        const float decay = exp(-exp(A_log[hv]) * sp);
+        const float beta  = 1.0f / (1.0f + exp(-float(b_buf[m * p.n_vh + hv])));
+
+        const float4 q_vec = float4(q_s[col4], q_s[col4+1], q_s[col4+2], q_s[col4+3]);
+        const float4 k_vec = float4(k_s[col4], k_s[col4+1], k_s[col4+2], k_s[col4+3]);
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            if (j < nrows) {
+                const int vi = int(sg) + 8 * j;
+                float4 s = sv[j] * decay;
+                const float v_pred = simd_sum(dot(s, k_vec));
+                const float delta  = beta * (float(v_ptr[vi]) - v_pred);
+                s = fma(float4(delta), k_vec, s);
+                sv[j] = s;
+                const float yv = simd_sum(dot(s, q_vec));
+                if (lane == 0) y_s[vi] = yv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float yv_t = (int(tid) < p.v_hd) ? y_s[tid] : 0.0f;
+        float y_ss = simd_sum(yv_t * yv_t);
+        if (lane == 0) sm_ss[sg] = y_ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float y_inv = rsqrt((sm_ss[0] + sm_ss[1] + sm_ss[2] + sm_ss[3]) / float(p.v_hd) + p.eps);
+        if (int(tid) < p.v_hd) {
+            const int o_idx = m * v_dim + hv * p.v_hd + int(tid);
+            const float zv = float(z_buf[o_idx]);
+            out[o_idx] = half((yv_t * y_inv * float(norm_w[tid])) * (zv / (1.0f + exp(-zv))));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // sm_ss / q_s / y_s dipakai ulang token berikutnya
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) if (j < nrows) S_head[(int(sg) + 8 * j) * stride4 + lane] = sv[j];
 }
 
 kernel void deltanet_commit_conv1d(
@@ -1634,16 +1759,21 @@ kernel void moe_combine_res(
     x_res[m * p.E + d4] = half4(float4(x_res[m * p.E + d4]) + acc);
 }
 
-// ─────────────────────── 8. Multi-Token Sparse Repetition Penalty + Exact Argmax ───────────────────────
-kernel void apply_rep_penalty_sparse(
-    device half* logits [[buffer(0)]], constant SparseRepParams& rp [[buffer(1)]],
+// ─────────────────────── 8. Repetition penalty PER BARIS + Argmax + Top-64 exact ───────────────────────
+// Baris m memverifikasi token SETELAH (riwayat + draft 1..m), jadi himpunan penalty-nya harus ikut
+// memuat draft itu — persis seperti decode berurutan. rows[m][0] = jumlah slot, rows[m][1..64] = token.
+struct RepRowsParams { int M, K_len, stride; float penalty; int rows[8 * 65]; };
+
+kernel void apply_rep_penalty_rows(
+    device half* logits [[buffer(0)]], constant RepRowsParams& rp [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
     const int i = int(gid.x), m = int(gid.y);
-    if (i >= rp.n_slots || m >= rp.M) return;
-    const int slot = rp.slots[i];
-    const ulong idx = ulong(m) * ulong(rp.K_len) + ulong(slot);
-    float v = float(logits[idx]);
+    if (m >= rp.M) return;
+    const int base = m * rp.stride;
+    if (i >= rp.rows[base]) return;
+    const ulong idx = ulong(m) * ulong(rp.K_len) + ulong(rp.rows[base + 1 + i]);
+    const float v = float(logits[idx]);
     logits[idx] = half((v > 0.0f) ? (v / rp.penalty) : (v * rp.penalty));
 }
 
@@ -1671,12 +1801,35 @@ kernel void argmax_full(
         out_tok[m] = fid;
     }
 }
-// ─────────────────────── 8B. Exact Top-64 Sorted Logit Extractor (256-Thread Top-2 -> 512 -> 1-SG SIMD Top-64, ~0.03ms!) ───────────────────────
+
+// Top-64 tersortir yang DIJAMIN exact:
+//  1) tiap thread menyimpan top-8 dari bagiannya + nilai terbesar yang ia buang (ev_max);
+//  2) tiap simdgroup memilih top-64 dari 256 kandidatnya; 3) simdgroup 0 memilih top-64 dari 512;
+//  4) bila ADA thread yang membuang nilai > nilai ke-64 hasil akhir, hasilnya mungkin tidak lengkap →
+//     out_flag[m] = 1 dan host menghitung ulang top-64 dari logits di CPU. (Versi lama hanya top-2 per
+//     thread dan diam-diam kehilangan token ±40% langkah.)
+inline void sg_select_top64(thread float* lv, thread int* li, int nreg,
+                            threadgroup float* dst_v, threadgroup int* dst_i, uint lane)
+{
+    for (int k = 0; k < 64; ++k) {
+        float best_v = lv[0]; int best_s = 0;
+        for (int j = 1; j < nreg; ++j) if (lv[j] > best_v) { best_v = lv[j]; best_s = j; }
+        const float gv = simd_max(best_v);
+        const int win_lane = simd_min((best_v == gv) ? int(lane) : 32);
+        const int win_id   = simd_broadcast(li[best_s], ushort(win_lane));
+        if (int(lane) == win_lane) {
+            for (int j = 0; j < nreg; ++j) if (j == best_s) lv[j] = -1e30f;
+        }
+        if (lane == 0) { dst_v[k] = gv; dst_i[k] = win_id; }
+    }
+}
+
 kernel void topk_logits_64(
     device const half* logits   [[buffer(0)]],
     device int*        out_ids  [[buffer(1)]],   // [M, 64]
     device float*      out_vals [[buffer(2)]],   // [M, 64]
     constant int&      V        [[buffer(3)]],
+    device int*        out_flag [[buffer(4)]],   // [M]: 1 = hitung ulang di CPU
     uint tg_x [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -1685,54 +1838,42 @@ kernel void topk_logits_64(
     const int m = int(tg_x);
     const device half* row = logits + ulong(m) * ulong(V);
 
-    // Pass 1: Each of 256 threads scans V/256 elements and tracks its Top-2
-    float b1 = -1e30f, b2 = -1e30f;
-    int   i1 = 0,      i2 = 0;
+    float bv[8]; int bi[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) { bv[j] = -1e30f; bi[j] = 0; }
+    float ev_max = -1e30f;
     for (int i = int(tid); i < V; i += 256) {
         const float v = float(row[i]);
-        if (v > b1) {
-            b2 = b1; i2 = i1;
-            b1 = v;  i1 = i;
-        } else if (v > b2) {
-            b2 = v;  i2 = i;
+        if (v > bv[7]) {
+            ev_max = max(ev_max, bv[7]);
+            int j = 7;
+            while (j > 0 && bv[j - 1] < v) { bv[j] = bv[j - 1]; bi[j] = bi[j - 1]; --j; }
+            bv[j] = v; bi[j] = i;
+        } else {
+            ev_max = max(ev_max, v);
         }
     }
 
-    threadgroup float tv[512];
-    threadgroup int   ti[512];
-    tv[tid]       = b1; ti[tid]       = i1;
-    tv[tid + 256] = b2; ti[tid + 256] = i2;
+    threadgroup float s_v[512]; threadgroup int s_i[512];
+    threadgroup float s_ev[8];
+    threadgroup float f_v[64]; threadgroup int f_i[64];   // threadgroup hanya boleh di scope kernel
+    sg_select_top64(bv, bi, 8, s_v + int(sg) * 64, s_i + int(sg) * 64, lane);
+    const float sg_ev = simd_max(ev_max);
+    if (lane == 0) s_ev[sg] = sg_ev;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Pass 2: Simdgroup 0 (32 lanes x 16 registers = 512 candidates) extracts exact sorted Top-64 in ~1.5us!
     if (sg == 0) {
-        float lv[16];
-        int   li[16];
+        float lv[16]; int li[16];
         #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int pos = int(lane) + j * 32;
-            lv[j] = tv[pos];
-            li[j] = ti[pos];
-        }
-        const int out_base = m * 64;
-        for (int k = 0; k < 64; ++k) {
-            float best_v = lv[0];
-            int   best_s = 0;
-            #pragma unroll
-            for (int j = 1; j < 16; ++j) {
-                if (lv[j] > best_v) { best_v = lv[j]; best_s = j; }
-            }
-            const float gv = simd_max(best_v);
-            const int win_lane = simd_min((best_v == gv) ? int(lane) : 32);
-            const int win_id   = simd_broadcast(li[best_s], ushort(win_lane));
-            if (int(lane) == win_lane) {
-                #pragma unroll
-                for (int j = 0; j < 16; ++j) if (j == best_s) lv[j] = -1e30f;
-            }
-            if (lane == 0) {
-                out_ids[out_base + k]  = win_id;
-                out_vals[out_base + k] = gv;
-            }
+        for (int j = 0; j < 16; ++j) { lv[j] = s_v[int(lane) + j * 32]; li[j] = s_i[int(lane) + j * 32]; }
+        sg_select_top64(lv, li, 16, f_v, f_i, lane);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float ev_all = -1e30f;
+        for (int s = 0; s < 8; ++s) ev_all = max(ev_all, s_ev[s]);
+        if (lane == 0) out_flag[m] = (ev_all > f_v[63]) ? 1 : 0;
+        for (int k = int(lane); k < 64; k += 32) {
+            out_ids[m * 64 + k]  = f_i[k];
+            out_vals[m * 64 + k] = f_v[k];
         }
     }
 }

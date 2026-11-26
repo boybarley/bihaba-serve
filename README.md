@@ -35,6 +35,8 @@ All benchmarks measured directly from `.safetensors` directories (**0 GB disk du
 | **Bihaba-AI-1.7B-Final** | 28L Qwen3 1.7B Dense (6b) | 1.40 GB | **367 ms** | **131.5 tok/s** | **222.4 tok/s** | — |
 | **MNN-Pocket-0.3B-MLX-4bit** | 28L Qwen3 0.3B Dense (4b) | 0.17 GB | **337 ms** | **337.6 tok/s** | **1,205.4 tok/s** | — |
 
+> **How to read the `Speculative k=7` column:** these numbers come from `bench`, whose prompt is a *synthetic repeating pattern* (the best case for n-gram drafting). On real chat/code the speedup depends on how repetitive the output is: typically 1.2–2× for code/JSON/RAG and ≈1× for free-form prose. The speculation is lossless (the output is identical to greedy), so it never makes quality worse. These v1.0 numbers have not yet been re-measured with v1.1; run the commands in *Testing v1.1 on your Mac* below.
+
 ---
 
 ## Supported Models
@@ -87,8 +89,12 @@ bihaba-serve list ~/models
 
 ### 3. Start OpenAI-Compatible API Server
 ```zsh
-# Single model
+# Single model (binds 127.0.0.1 by default)
 bihaba-serve serve --model ~/models/Bihaba-bagus-pakai --top-k 4 --temp 0.6 --port 8090
+
+# Exposed on the LAN: always with an API key; allow HTTP baking only into one folder
+bihaba-serve serve --model ~/models/Bihaba-bagus-pakai --top-k 4 --host 0.0.0.0 \
+  --api-key "$(openssl rand -hex 24)" --state-dir ~/.bihaba/states --cors '*'
 
 # Multi-model hot-swap from your ~/models directory
 bihaba-serve serve --models-dir ~/models --model ~/models/Bihaba-bagus-pakai --top-k 4 --port 8090
@@ -110,6 +116,44 @@ bihaba-serve serve --model ~/models/Bihaba-bagus-pakai --top-k 4   --load-state 
 ```zsh
 bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --profile --tokens 128
 ```
+
+---
+
+## What's new in v1.1
+
+**Faster**
+- **Prefill uses 32-token MMA tiles** (`*_mmaP` kernels). Each weight tile read from memory is reused for 32 tokens instead of 8, so the main cost of a long prompt is cut by roughly 4×. DeltaNet prefill now runs a dedicated kernel that keeps the state in registers for the whole chunk. The LM head is computed only for the last prompt token. Control it with `--prefill-chunk N` (1..32; 8 = v1.0 behaviour).
+- **Speculative decoding:** a per-n-gram-order acceptance estimator, α = accepted / (accepted + rejections), replaces the old EMA, which penalized k too hard after a single rejection.
+
+**Correct**
+- **Top-64 sampling is now exact.** Each thread tracks the largest candidate it evicted. If any evicted candidate beats the 64th result, that row is recomputed on the CPU (rare). v1.0 silently dropped candidates on a large fraction of steps.
+- **Repetition penalty per verification row:** row *m* sees history plus drafts 1..m, so the speculative output equals the non-speculative output. The default is now `1.0` (off).
+- **Bounds checks:**
+  - `max_seq` is checked on every request;
+  - token ids and `prefix_len` are validated;
+  - unsupported architectures and quantization are rejected at load instead of producing garbage.
+- **`.tstate` v2:** the header carries a model fingerprint and every size is checked before loading, and saves are atomic. v1 files are rejected, so re-bake them.
+- **Stream fixes:**
+  - when a client disconnects mid-stream, the engine output is drained, so it no longer leaks into the next request;
+  - engine errors become HTTP 400;
+  - a model hot-swap no longer closes a daemon that another request is still using.
+- **`align` writes through HuggingFace-cache symlinks.** The cache stays intact and the disk is not doubled. It also checks free disk space first.
+
+**Secure by default**
+- The server binds `127.0.0.1`.
+- `--api-key` (or env `BIHABA_API_KEY`) enforces Bearer authentication.
+- CORS is off unless `--cors` is given.
+- Request bodies are limited to 16 MB.
+- `/v1/state/bake` can write only `<name>.tstate` inside `--state-dir`. In v1.0 the HTTP `path` field could write anywhere on disk.
+
+### Testing v1.1 on your Mac
+```zsh
+make                                                        # build both engines (Metal compiles at first run)
+python3 -m unittest discover -s tests -v                    # offline tests: no GPU or model needed
+bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --tokens 128                     # decode + prefill A/B
+bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --tokens 128 --prefill-chunk 8   # v1.0 prefill path
+```
+`bench` prints a prefill A/B (chunk 8 vs active chunk, 512 tokens) and the greedy-vs-speculative match (`=greedy`).
 
 ---
 
