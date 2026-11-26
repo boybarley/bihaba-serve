@@ -814,6 +814,38 @@ inline void load_w_tile(device const uint32_t* w, device const ushort* scales, d
     }
 }
 
+// Akumulator MMA sebagai variabel bernama (c0..c3), BUKAN array simdgroup_matrix.
+// Versi array (c[MT]) + loop dengan break dinamis membuat compiler Metal menaruh akumulator di memori:
+// terukur 1.5–1.6× lebih lambat di M=8 (Qwythos-9B FFN 32→50 ms). MT adalah konstanta template, jadi
+// cabang `MT > 1` hilang total pada varian mma8.
+#define MMA_ACC_TILE(XS, WSG, C0, C1, C2, C3) \
+    _Pragma("unroll") \
+    for (int kk = 0; kk < 64; kk += 8) { \
+        simdgroup_half8x8 bt, a; \
+        simdgroup_load(bt, (WSG) + kk, 72, ulong2(0, 0), true); \
+        simdgroup_load(a, (XS) + kk, 64); \
+        simdgroup_multiply_accumulate(C0, a, bt, C0); \
+        if (MT > 1) { \
+            if (M > 8)  { simdgroup_load(a, (XS) + 8 * 64 + kk, 64);  simdgroup_multiply_accumulate(C1, a, bt, C1); } \
+            if (M > 16) { simdgroup_load(a, (XS) + 16 * 64 + kk, 64); simdgroup_multiply_accumulate(C2, a, bt, C2); } \
+            if (M > 24) { simdgroup_load(a, (XS) + 24 * 64 + kk, 64); simdgroup_multiply_accumulate(C3, a, bt, C3); } \
+        } \
+    }
+
+inline void qmm_store_tile(simdgroup_float8x8 c, int m0, threadgroup float* cbuf, device half* out,
+                           int M, int N, int n_base, uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(c, cbuf, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < 2; ++q) {
+        const int idx = int(lane) * 2 + q, m = m0 + (idx >> 3), col = n_base + (idx & 7);
+        if (m < M && col < N) {
+            if (ADD_RES_C) out[m * N + col] += half(cbuf[idx]);
+            else           out[m * N + col]  = half(cbuf[idx]);
+        }
+    }
+}
+
 template <int BITS, int MT>
 inline void qmm_bk64_impl(
     device const half* x, device const uint32_t* w, device const ushort* scales, device const ushort* biases,
@@ -827,46 +859,23 @@ inline void qmm_bk64_impl(
     const int row_base = int(tg_x) * 32;
     const int r = min(row_base + (int(tid) >> 2), N - 1);
 
-    simdgroup_float8x8 c[MT];
-    #pragma unroll
-    for (int t = 0; t < MT; ++t) c[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
+    simdgroup_float8x8 c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), c1 = c0, c2 = c0, c3 = c0;
     const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
     for (int k0 = 0; k0 < K; k0 += BK) {
         load_x_tile<MT>(x, M, K, k0, Xs, tid);
         load_w_tile<BITS>(w, scales, biases, r, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma unroll
-        for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt;
-            simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            #pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                if (t * 8 < M) {
-                    simdgroup_half8x8 a;
-                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
-                    simdgroup_multiply_accumulate(c[t], a, bt, c[t]);
-                }
-            }
-        }
+        MMA_ACC_TILE(Xs, w_sg, c0, c1, c2, c3)
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup float* cbuf = Cs + int(sg) * 64;
     const int n_base = row_base + int(sg) * 8;
-    #pragma unroll
-    for (int t = 0; t < MT; ++t) {
-        if (t * 8 >= M) break;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_store(c[t], cbuf, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int q = 0; q < 2; ++q) {
-            const int idx = int(lane) * 2 + q, m = t * 8 + (idx >> 3), col = n_base + (idx & 7);
-            if (m < M && col < N) {
-                if (ADD_RES_C) out[m * N + col] += half(cbuf[idx]);
-                else           out[m * N + col]  = half(cbuf[idx]);
-            }
-        }
+    qmm_store_tile(c0, 0, cbuf, out, M, N, n_base, lane);
+    if (MT > 1) {
+        if (M > 8)  qmm_store_tile(c1, 8,  cbuf, out, M, N, n_base, lane);
+        if (M > 16) qmm_store_tile(c2, 16, cbuf, out, M, N, n_base, lane);
+        if (M > 24) qmm_store_tile(c3, 24, cbuf, out, M, N, n_base, lane);
     }
 }
 
@@ -945,6 +954,22 @@ kernel void NAME( \
 DECL_QKV_MMA(q35_qkv_proj_4b_mma8, 1)
 DECL_QKV_MMA(q35_qkv_proj_4b_mmaP, 4)
 
+inline void swiglu_store_tile(simdgroup_float8x8 cg, simdgroup_float8x8 cu, int m0,
+                              threadgroup float* gbuf, threadgroup float* ubuf, device half* out,
+                              int M, int N, int n_base, uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(cg, gbuf, 8);
+    simdgroup_store(cu, ubuf, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < 2; ++q) {
+        const int idx = int(lane) * 2 + q, m = m0 + (idx >> 3), col = n_base + (idx & 7);
+        if (m < M && col < N) {
+            const float gv = gbuf[idx];
+            out[m * N + col] = half((gv / (1.0f + exp(-gv))) * ubuf[idx]);
+        }
+    }
+}
+
 template <int BITS, int MT>
 inline void swiglu_bk64_impl(
     device const half* x,
@@ -959,68 +984,31 @@ inline void swiglu_bk64_impl(
     const int row_base = int(tg_x) * 32;
     const int r = min(row_base + (int(tid) >> 2), N - 1);
 
-    simdgroup_float8x8 cg[MT], cu[MT];
-    #pragma unroll
-    for (int t = 0; t < MT; ++t) {
-        cg[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-        cu[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    }
+    simdgroup_float8x8 g0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g1 = g0, g2 = g0, g3 = g0;
+    simdgroup_float8x8 u0 = g0, u1 = g0, u2 = g0, u3 = g0;
     const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
 
     for (int k0 = 0; k0 < K; k0 += BK) {
         load_x_tile<MT>(x, M, K, k0, Xs, tid);
         load_w_tile<BITS>(wg, sg_a, bg_a, r, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma unroll
-        for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt;
-            simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            #pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                if (t * 8 < M) {
-                    simdgroup_half8x8 a;
-                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
-                    simdgroup_multiply_accumulate(cg[t], a, bt, cg[t]);
-                }
-            }
-        }
+        MMA_ACC_TILE(Xs, w_sg, g0, g1, g2, g3)
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         load_w_tile<BITS>(wu, su_a, bu_a, r, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        #pragma unroll
-        for (int kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 bt;
-            simdgroup_load(bt, w_sg + kk, WS, ulong2(0, 0), true);
-            #pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                if (t * 8 < M) {
-                    simdgroup_half8x8 a;
-                    simdgroup_load(a, Xs + t * 8 * BK + kk, BK);
-                    simdgroup_multiply_accumulate(cu[t], a, bt, cu[t]);
-                }
-            }
-        }
+        MMA_ACC_TILE(Xs, w_sg, u0, u1, u2, u3)
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup float* gbuf = Cg_s + int(sg) * 64;
     threadgroup float* ubuf = Cu_s + int(sg) * 64;
     const int n_base = row_base + int(sg) * 8;
-    #pragma unroll
-    for (int t = 0; t < MT; ++t) {
-        if (t * 8 >= M) break;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_store(cg[t], gbuf, 8);
-        simdgroup_store(cu[t], ubuf, 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (int q = 0; q < 2; ++q) {
-            const int idx = int(lane) * 2 + q, m = t * 8 + (idx >> 3), col = n_base + (idx & 7);
-            if (m < M && col < N) {
-                const float gv = gbuf[idx];
-                out[m * N + col] = half((gv / (1.0f + exp(-gv))) * ubuf[idx]);
-            }
-        }
+    swiglu_store_tile(g0, u0, 0, gbuf, ubuf, out, M, N, n_base, lane);
+    if (MT > 1) {
+        if (M > 8)  swiglu_store_tile(g1, u1, 8,  gbuf, ubuf, out, M, N, n_base, lane);
+        if (M > 16) swiglu_store_tile(g2, u2, 16, gbuf, ubuf, out, M, N, n_base, lane);
+        if (M > 24) swiglu_store_tile(g3, u3, 24, gbuf, ubuf, out, M, N, n_base, lane);
     }
 }
 
