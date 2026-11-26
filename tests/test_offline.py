@@ -335,5 +335,49 @@ class TestDaemonDrain(unittest.TestCase):
             d.proc.kill(); d.proc.wait(); d.proc.stdin.close(); d.proc.stdout.close()
 
 
+# ─── Port dari dequant_gen16_to_tg (MMA 3/6/8-bit) vs unpack referensi ─────────────────────────
+def pack_mlx(q, bits):
+    """Bit-stream LSB-first, sama dengan mlx.core.quantize."""
+    acc, n, words = 0, 0, []
+    for v in q:
+        acc |= int(v) << n
+        n += bits
+        while n >= 32:
+            words.append(acc & 0xFFFFFFFF); acc >>= 32; n -= 32
+    if n:
+        words.append(acc & 0xFFFFFFFF)
+    return words
+
+
+def dequant_gen16(wrow, k, bits):
+    mask = (1 << bits) - 1
+    nw = (16 * bits + 31) // 32 + 1
+    bit0 = k * bits
+    base, sh = bit0 >> 5, bit0 & 31
+    a = [(wrow[base + i] if i * 32 < sh + 16 * bits else 0) for i in range(nw)]
+    out = []
+    for j in range(16):
+        pos = sh + j * bits
+        wi, o = pos >> 5, pos & 31
+        q = a[wi] >> o
+        if o + bits > 32:
+            q |= (a[wi + 1] << (32 - o)) & 0xFFFFFFFF
+        out.append(q & mask)
+    return out
+
+
+@unittest.skipIf(np is None, "numpy tidak tersedia")
+class TestGenericDequant(unittest.TestCase):
+    def test_bits_3_6_8(self):
+        rng = np.random.default_rng(1)
+        for bits in (3, 6, 8):
+            K = 256
+            q = rng.integers(0, 1 << bits, size=K)
+            w = pack_mlx(q, bits)
+            self.assertEqual(len(w), K * bits // 32)            # = row_words di kernel
+            for k in range(0, K, 16):
+                self.assertEqual(dequant_gen16(w, k, bits), list(q[k:k + 16]), (bits, k))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

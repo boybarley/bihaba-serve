@@ -270,6 +270,8 @@ struct TransformerEngine {
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
     id<MTLComputePipelineState> pso_qmm4_mma8=nil, pso_qmm4_mma8_add=nil, pso_qmm2_mma8=nil, pso_qmm2_mma8_add=nil;
     id<MTLComputePipelineState> pso_sw4_mma8=nil, pso_sw2_mma8=nil;
+    // MMA generik per bit-width: [bits][0=mma8,1=mmaP][add_res] dan swiglu [bits][mma8/mmaP]. nil = tidak ada.
+    id<MTLComputePipelineState> pso_mm[9][2][2] = {}, pso_swm[9][2] = {};
     id<MTLComputePipelineState> pso_qmm4_mmaP=nil, pso_qmm4_mmaP_add=nil, pso_qmm2_mmaP=nil, pso_qmm2_mmaP_add=nil;
     id<MTLComputePipelineState> pso_sw4_mmaP=nil, pso_sw2_mmaP=nil;
     id<MTLComputePipelineState> pso_qk_rope=nil, pso_gqa=nil;
@@ -606,6 +608,16 @@ struct TransformerEngine {
         pso_qmm2_mma8_add = make_pso(dev, lib, "qmm_2b_mma8",             true,  bf);
         pso_sw4_mma8      = make_pso(dev, lib, "dense_swiglu_4b_mma8",    false, bf);
         pso_sw2_mma8      = make_pso(dev, lib, "dense_swiglu_2b_mma8",    false, bf);
+        for (int bb : {2, 3, 4, 6, 8}) {
+            for (int P = 0; P < 2; ++P) {
+                char qn[48], sn[48];
+                snprintf(qn, sizeof(qn), "qmm_%db_%s", bb, P ? "mmaP" : "mma8");
+                snprintf(sn, sizeof(sn), "dense_swiglu_%db_%s", bb, P ? "mmaP" : "mma8");
+                pso_mm[bb][P][0] = make_pso(dev, lib, qn, false, bf);
+                pso_mm[bb][P][1] = make_pso(dev, lib, qn, true,  bf);
+                pso_swm[bb][P]   = make_pso(dev, lib, sn, false, bf);
+            }
+        }
         pso_qk_rope       = make_pso(dev, lib, "tr_qknorm_rope_kv",       false, bf);
         pso_gqa           = make_pso(dev, lib, (head_dim == 64 ? "gqa_attention_64" : (head_dim == 128 ? "gqa_attention_128" : "gqa_attention_256")), false, bf);
 
@@ -746,7 +758,7 @@ struct TransformerEngine {
     //   lainnya    : qmv multi-token; M>8 tanpa MMA (3/8-bit) dipecah per 8 baris (kernelnya hanya 8 akumulator)
     void enc_qmv(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& qt, id<MTLBuffer> outp,
                  bool add_res, int in_row = 0, int out_row = 0) {
-        const bool mma_ok = (qt.bits == 4 || qt.bits == 2) && (qt.K % 64 == 0);
+        const bool mma_ok = qt.bits >= 2 && qt.bits <= 8 && pso_mm[qt.bits][0][0] != nil && (qt.K % 64 == 0);
         if (M > MAX_M && !mma_ok) {
             for (int r0 = 0; r0 < M; r0 += MAX_M)
                 enc_qmv(e, std::min(MAX_M, M - r0), inp, qt, outp, add_res, in_row + r0, out_row + r0);
@@ -758,8 +770,7 @@ struct TransformerEngine {
         if (M == 1) {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
         } else if (M >= 4 && mma_ok) {
-            if (M > MAX_M) pso = (qt.bits == 4) ? (add_res ? pso_qmm4_mmaP_add : pso_qmm4_mmaP) : (add_res ? pso_qmm2_mmaP_add : pso_qmm2_mmaP);
-            else           pso = (qt.bits == 4) ? (add_res ? pso_qmm4_mma8_add : pso_qmm4_mma8) : (add_res ? pso_qmm2_mma8_add : pso_qmm2_mma8);
+            pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
             rows_per_tg = 32;
         } else {
             pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
@@ -775,7 +786,7 @@ struct TransformerEngine {
 
     void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp,
                     int row0 = 0) {
-        const bool mma_ok = (gp.bits == 4 || gp.bits == 2) && gp.bits == up.bits && (gp.K % 64 == 0);
+        const bool mma_ok = gp.bits >= 2 && gp.bits <= 8 && pso_swm[gp.bits][0] != nil && gp.bits == up.bits && (gp.K % 64 == 0);
         if (M > MAX_M && !mma_ok) {
             for (int r0 = 0; r0 < M; r0 += MAX_M) enc_swiglu(e, std::min(MAX_M, M - r0), inp, gp, up, outp, row0 + r0);
             return;
@@ -783,7 +794,7 @@ struct TransformerEngine {
         QMVMultiParams p{M, gp.K, gp.N, gp.gs_shift};
         const bool use_mma = (M >= 4 && mma_ok);
         id<MTLComputePipelineState> pso = use_mma
-            ? (M > MAX_M ? (gp.bits == 4 ? pso_sw4_mmaP : pso_sw2_mmaP) : (gp.bits == 4 ? pso_sw4_mma8 : pso_sw2_mma8))
+            ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
         const int rows_per_tg = use_mma ? 32 : 4;
         [e setComputePipelineState:pso];

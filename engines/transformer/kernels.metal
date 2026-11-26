@@ -595,6 +595,30 @@ inline void load_x_tile(device const half* x, int M, int K, int k0, threadgroup 
     }
 }
 
+// Dekuantisasi generik 16 nilai berurutan (bit-stream LSB-first ala MLX) untuk 3/6/8-bit.
+// k kelipatan 16 → offset bit awal: 8-bit & 6-bit selalu 0, 3-bit 0 atau 16. Tidak membaca melewati blok.
+template <int BITS>
+inline void dequant_gen16_to_tg(device const uint32_t* wrow, int k, float s, float b, threadgroup half* dst) {
+    constexpr uint MASK = (1u << BITS) - 1u;
+    constexpr int NW = (16 * BITS + 31) / 32 + 1;
+    const uint bit0 = uint(k) * uint(BITS);
+    const device uint32_t* p = wrow + (bit0 >> 5);
+    const uint sh = bit0 & 31u;
+    uint a[NW];
+    #pragma unroll
+    for (int i = 0; i < NW; ++i) a[i] = (uint(i) * 32u < sh + 16u * uint(BITS)) ? p[i] : 0u;
+    half v[16];
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const uint pos = sh + uint(j) * uint(BITS), wi = pos >> 5, o = pos & 31u;
+        uint q = a[wi] >> o;
+        if (o + uint(BITS) > 32u) q |= a[wi + 1] << (32u - o);
+        v[j] = half(fma(float(q & MASK), s, b));
+    }
+    #pragma unroll
+    for (int j = 0; j < 16; j += 4) *((threadgroup half4*)(dst + j)) = half4(v[j], v[j + 1], v[j + 2], v[j + 3]);
+}
+
 // Dekuantisasi tile bobot 32 baris × 64 K (4 thread per baris, 16 nilai per thread)
 template <int BITS>
 inline void load_w_tile(device const uint32_t* w, device const ushort* scales, device const ushort* biases,
@@ -609,8 +633,11 @@ inline void load_w_tile(device const uint32_t* w, device const ushort* scales, d
         const ulong w_idx = ulong(r) * ulong(K >> 3) + ulong((k0 >> 3) + wi * 2);
         dequant_4bit_to_tg(w[w_idx],     hs, hb, w_dst);
         dequant_4bit_to_tg(w[w_idx + 1], hs, hb, w_dst + 8);
-    } else {
+    } else if (BITS == 2) {
         dequant_2bit_to_tg(w[ulong(r) * ulong(K >> 4) + ulong((k0 >> 4) + wi)], hs, hb, w_dst);
+    } else {
+        const ulong row_words = ulong((K * BITS) >> 5);
+        dequant_gen16_to_tg<BITS>(w + ulong(r) * row_words, k0 + wi * 16, float(hs.x), float(hb.x), w_dst);
     }
 }
 
@@ -684,6 +711,12 @@ DECL_QMM(qmm_4b_mma8, 4, 1)
 DECL_QMM(qmm_2b_mma8, 2, 1)
 DECL_QMM(qmm_4b_mmaP, 4, 4)
 DECL_QMM(qmm_2b_mmaP, 2, 4)
+DECL_QMM(qmm_3b_mma8, 3, 1)
+DECL_QMM(qmm_3b_mmaP, 3, 4)
+DECL_QMM(qmm_6b_mma8, 6, 1)
+DECL_QMM(qmm_6b_mmaP, 6, 4)
+DECL_QMM(qmm_8b_mma8, 8, 1)
+DECL_QMM(qmm_8b_mmaP, 8, 4)
 
 template <int BITS, int MT>
 inline void swiglu_bk64_impl(
@@ -779,6 +812,12 @@ DECL_SWIG_MMA(dense_swiglu_4b_mma8, 4, 1)
 DECL_SWIG_MMA(dense_swiglu_2b_mma8, 2, 1)
 DECL_SWIG_MMA(dense_swiglu_4b_mmaP, 4, 4)
 DECL_SWIG_MMA(dense_swiglu_2b_mmaP, 2, 4)
+DECL_SWIG_MMA(dense_swiglu_3b_mma8, 3, 1)
+DECL_SWIG_MMA(dense_swiglu_3b_mmaP, 3, 4)
+DECL_SWIG_MMA(dense_swiglu_6b_mma8, 6, 1)
+DECL_SWIG_MMA(dense_swiglu_6b_mmaP, 6, 4)
+DECL_SWIG_MMA(dense_swiglu_8b_mma8, 8, 1)
+DECL_SWIG_MMA(dense_swiglu_8b_mmaP, 8, 4)
 
 // ─────────────────────── 5. Unified QK-Norm + Optional QKV Bias + Split-Half RoPE (hd=64/128/256) ───────────────────────
 kernel void tr_qknorm_rope_kv(
