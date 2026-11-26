@@ -137,7 +137,7 @@ bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --profile --tok
 ## What's new in v1.1 / v1.2
 
 **Faster**
-- **Prefill uses a dedicated GEMM kernel** (`*_gemm`, 32 tokens × 64 weight rows per threadgroup, 8 accumulators per simdgroup). It covers every bit-width (2/3/4/6/8). Each weight tile is dequantized once and reused for 32 tokens. Verification steps (M ≤ 8) now also use MMA for 3/6/8-bit models. DeltaNet prefill now runs a dedicated kernel that keeps the state in registers for the whole chunk. The LM head is computed only for the last prompt token. Control it with `--prefill-chunk N` (1..32; 8 = v1.0 behaviour).
+- **Prefill uses a dedicated GEMM kernel** (`*_gemm`, 32 tokens × 64 weight rows per threadgroup, 8 accumulators per simdgroup). It covers every bit-width (2/3/4/6/8). Each weight tile is dequantized once and reused for 32 tokens, and a 128-token chunk adds a second grid dimension so every GPU core stays busy. Verification steps (M ≤ 8) now also use MMA for 3/6/8-bit models. DeltaNet prefill now runs a dedicated kernel that keeps the state in registers for the whole chunk. The LM head is computed only for the last prompt token. Control it with `--prefill-chunk N` (1..128, default 128; 8 = v1.0 behaviour).
 - **Speculative decoding:** a per-n-gram-order acceptance estimator, α = accepted / (accepted + rejections), replaces the old EMA, which penalized k too hard after a single rejection.
 
 **Correct**

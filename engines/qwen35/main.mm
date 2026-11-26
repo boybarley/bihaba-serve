@@ -279,8 +279,8 @@ static void check_qtensor(const char* name, int bits, int gs, int K, int N) {
 
 struct Qwen35Engine {
     static constexpr int MAX_M = 8;     // batas verifikasi spekulatif (draft ≤ 7)
-    static constexpr int MAX_P = 32;    // batas chunk prefill (kernel MMA 4 tile)
-    int prefill_chunk = MAX_P;          // --prefill-chunk (1..32); 8 = perilaku lama
+    static constexpr int MAX_P = 128;   // batas chunk prefill (GEMM: grid y = M/32 → GPU penuh terisi)
+    int prefill_chunk = MAX_P;          // --prefill-chunk (1..128); 8 = perilaku lama
     uint64_t model_fp = 0;              // sidik jari model untuk validasi .tstate
 
     std::vector<MappedFile> mapped_files;
@@ -1190,7 +1190,7 @@ struct Qwen35Engine {
     // Proyeksi terkuantisasi untuk M baris (M ≤ MAX_P). in_row/out_row = offset dalam BARIS (stride K / N).
     //   M=1        : qmv dual-row (decode)
     //   M=4..8     : MMA 1 tile   (verifikasi spekulatif)
-    //   M=9..32    : MMA 4 tile   (prefill) — tile bobot dipakai ulang untuk 32 token
+    //   M=9..128   : GEMM 32×64   (prefill) — tile bobot dipakai ulang untuk 32 token, grid y = M/32
     //   lainnya    : qmv multi-token; M>8 tanpa MMA (3/8-bit) dipecah per 8 baris (kernelnya hanya 8 akumulator)
     void enc_qmv(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& qt, id<MTLBuffer> outp,
                  bool add_res, int in_row = 0, int out_row = 0) {
@@ -1217,7 +1217,8 @@ struct Qwen35Engine {
         [e setBuffer:outp offset:ooff atIndex:4];
         if (multi) { QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift}; [e setBytes:&p length:sizeof(p) atIndex:5]; }
         else       { QMVParams p{qt.K, qt.N, qt.gs_shift};         [e setBytes:&p length:sizeof(p) atIndex:5]; }
-        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        const NSUInteger gy = (multi && rows_per_tg == 64) ? NSUInteger((M + 31) / 32) : 1;
+        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
     void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp,
@@ -1238,7 +1239,8 @@ struct Qwen35Engine {
         [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
         [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
         [e setBuffer:outp offset:NSUInteger(row0) * NSUInteger(gp.N) * 2 atIndex:7]; [e setBytes:&p length:sizeof(p) atIndex:8];
-        [e dispatchThreadgroups:MTLSizeMake((gp.N + rows_per_tg - 1) / rows_per_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        const NSUInteger gy = (rows_per_tg == 64) ? NSUInteger((M + 31) / 32) : 1;
+        [e dispatchThreadgroups:MTLSizeMake((gp.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
     // prefill=true: DeltaNet memakai kernel prefill (state langsung diperbarui, M bebas, tanpa commit tertunda).
@@ -1880,7 +1882,7 @@ int main(int argc, char** argv) {
             printf("Usage (Direct Zero-Copy ~/models/<dir> OR .taalas2 binary):\n");
             printf("  Profile: %s <model_dir> --profile [--bench 128] [--top-k 4] [--spec 7] [--max-seq 4096]\n", argv[0]);
             printf("  Daemon:  %s <model_dir> --daemon [--state <baked.tstate>] [--top-k 4] [--spec 7] [--rep-penalty 1.0]\n", argv[0]);
-            printf("  Opsi:    --prefill-chunk 32 (1..32; 8 = perilaku lama) --max-seq 4096 --temp 0\n");
+            printf("  Opsi:    --prefill-chunk 128 (1..128; 8 = perilaku lama) --max-seq 4096 --temp 0\n");
             return 1;
         }
         std::string model_path = argv[1], state_path = "";
@@ -1938,7 +1940,7 @@ int main(int argc, char** argv) {
             {
                 std::vector<int32_t> pp(512);
                 for (size_t i = 0; i < pp.size(); ++i) pp[i] = int32_t((i * 7919u + 13u) % uint32_t(std::min(eng.vocab, 150000)));
-                for (int ch : {8, eng.prefill_chunk}) {
+                for (int ch : {8, 32, eng.prefill_chunk}) {
                     const int saved = eng.prefill_chunk;
                     eng.prefill_chunk = ch;
                     double best = 1e30;
@@ -1951,7 +1953,7 @@ int main(int argc, char** argv) {
                     }
                     eng.prefill_chunk = saved;
                     printf("▸ Prefill Bench (512 tok, chunk %2d):      %.1f ms => %.0f tok/s\n", ch, best, 512 * 1000.0 / best);
-                    if (ch == eng.prefill_chunk) break;
+                    if (ch == eng.prefill_chunk || ch > eng.prefill_chunk) break;
                 }
                 // Kebenaran prefill: 32 token greedy setelah prompt yang sama, chunk 8 (jalur MMA-8 v1.0) vs chunk aktif.
                 if (eng.prefill_chunk != 8) {

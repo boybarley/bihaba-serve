@@ -41,7 +41,7 @@ class EngineDaemon:
         max_seq: int = 4096,
         load_state: str | None = None,
         default_temp: float = 0.0,
-        prefill_chunk: int = 32,
+        prefill_chunk: int = 128,
     ):
         self.info = model_info
         self.enable_thinking = enable_thinking

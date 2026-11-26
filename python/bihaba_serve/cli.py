@@ -99,7 +99,7 @@ def main() -> None:
     p_srv.add_argument("--temp", type=float, default=0.6)
     p_srv.add_argument("--rep-penalty", type=float, default=1.0,
                        help="1.0 = mati (default). >1 merusak kode/JSON & menurunkan penerimaan spekulasi")
-    p_srv.add_argument("--prefill-chunk", type=int, default=32, help="Token per langkah prefill (1..32; 8 = perilaku lama)")
+    p_srv.add_argument("--prefill-chunk", type=int, default=128, help="Token per langkah prefill (1..128; 8 = perilaku lama)")
     p_srv.add_argument("--thinking", action="store_true")
     p_srv.add_argument("--system-file", default=None, help="Pre-bake system prompt into GPU RAM on startup")
     p_srv.add_argument("--load-state", default=None, help="Preload baked .tstate snapshot on startup (0ms TTFT)")
@@ -118,7 +118,7 @@ def main() -> None:
     p_chat.add_argument("--max-seq", type=int, default=4096)
     p_chat.add_argument("--temp", type=float, default=0.6)
     p_chat.add_argument("--rep-penalty", type=float, default=1.0)
-    p_chat.add_argument("--prefill-chunk", type=int, default=32)
+    p_chat.add_argument("--prefill-chunk", type=int, default=128)
     p_chat.add_argument("--thinking", action="store_true")
     p_chat.add_argument("--max-tokens", type=int, default=512)
     p_chat.add_argument("--system-file", default=None)
@@ -130,7 +130,7 @@ def main() -> None:
     p_b.add_argument("--spec", type=int, default=7)
     p_b.add_argument("--tokens", type=int, default=128)
     p_b.add_argument("--profile", action="store_true")
-    p_b.add_argument("--prefill-chunk", type=int, default=32)
+    p_b.add_argument("--prefill-chunk", type=int, default=128)
 
     p_bk = sub.add_parser("bake", help="Bake a system prompt / RAG prefix into a persistent .tstate file")
     p_bk.add_argument("--model", required=True)

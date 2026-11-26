@@ -807,7 +807,7 @@ DECL_SWIG_MMA(dense_swiglu_6b_mmaP, 6, 4)
 DECL_SWIG_MMA(dense_swiglu_8b_mma8, 8, 1)
 DECL_SWIG_MMA(dense_swiglu_8b_mmaP, 8, 4)
 
-// ─────────────────────── 4G. Prefill GEMM (M=9..32): tile 32 token × 64 baris bobot ───────────────────────
+// ─────────────────────── 4G. Prefill GEMM (M=9..MAX_P): tile 32 token × 64 baris bobot, grid (N/64, M/32) ───────────────────────
 // 4 simdgroup, masing-masing 16 token × 32 baris = 8 akumulator. Per langkah kk: 2 load A + 4 load B untuk
 // 8 MMA (0.75 load/MMA) vs kernel mmaP 1.25 load/MMA. Dekuantisasi 64 baris dibagi untuk 32 token.
 #define GEMM_LD 72
@@ -943,22 +943,25 @@ inline void swiglu_gemm_impl(
 kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
     device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
     constant QMVMultiParams& p [[buffer(5)]], \
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
 { \
     threadgroup half Xs[32 * GEMM_LD], Ws[64 * GEMM_LD]; threadgroup float Cs[4 * 64]; \
-    qmm_gemm_impl<BITS>(x, w, s, b, out, p, Xs, Ws, Cs, tg_x, tid, sg, lane); \
+    const int mb = int(tgp.y) * 32; QMVMultiParams q = p; q.M = min(32, p.M - mb); \
+    qmm_gemm_impl<BITS>(x + ulong(mb) * ulong(p.K), w, s, b, out + ulong(mb) * ulong(p.N), q, Xs, Ws, Cs, tgp.x, tid, sg, lane); \
 }
 #define DECL_SWIG_GEMM(NAME, BITS) \
 kernel void NAME(device const half* x [[buffer(0)]], \
     device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
     device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
     device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]], \
-    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
 { \
     threadgroup half Xs[32 * GEMM_LD], Ws[64 * GEMM_LD]; threadgroup float Cg_s[4 * 64], Cu_s[4 * 64]; \
-    swiglu_gemm_impl<BITS>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, Xs, Ws, Cg_s, Cu_s, tg_x, tid, sg, lane); \
+    const int mb = int(tgp.y) * 32; QMVMultiParams q = p; q.M = min(32, p.M - mb); \
+    swiglu_gemm_impl<BITS>(x + ulong(mb) * ulong(p.K), wg, sg_a, bg_a, wu, su_a, bu_a, out + ulong(mb) * ulong(p.N), q, \
+                           Xs, Ws, Cg_s, Cu_s, tgp.x, tid, sg, lane); \
 }
 DECL_QMM_GEMM(qmm_2b_gemm, 2)
 DECL_SWIG_GEMM(dense_swiglu_2b_gemm, 2)
