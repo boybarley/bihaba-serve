@@ -115,6 +115,17 @@ bihaba-serve serve --model ~/models/Bihaba-bagus-pakai --top-k 4 --host 0.0.0.0 
 bihaba-serve serve --models-dir ~/models --model ~/models/Bihaba-bagus-pakai --top-k 4 --port 8090
 ```
 
+### 3b. Web Console (built in)
+Open `http://127.0.0.1:8090/` in a browser once the server is running. The page is served by the same server, so it needs no `--cors`. It offers:
+- **Streaming chat** with markdown, code blocks with a copy button, and collapsible `<think>` reasoning;
+- **Model picker** (hot-swap; needs `--models-dir`);
+- **Live telemetry:** tok/s, TTFT, prefill time, tokens per speculative step and reused prefix;
+- **Sampling controls:** temperature, top-p/k, min-p, repetition penalty, max tokens and a fixed seed;
+- **System prompt** with a one-click **Bake to GPU** button;
+- **Chat history** stored locally, with edit, regenerate and Markdown/JSON export and import.
+
+When the server uses `--api-key`, enter the key in the Connection panel.
+
 ### 4. Interactive Terminal Chat
 ```zsh
 bihaba-serve chat --model ~/models/Bihaba-bagus-pakai --top-k 4 --temp 0.6

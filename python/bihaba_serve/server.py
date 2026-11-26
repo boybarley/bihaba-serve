@@ -20,6 +20,7 @@ from . import __version__
 from .daemon import ModelPool
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
+WEB_UI = Path(__file__).resolve().parent / "web" / "index.html"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -79,6 +80,21 @@ def run_server(pool: ModelPool, host: str, port: int, api_key: str | None = None
             self.end_headers()
 
         def do_GET(self):
+            if self.path in ("/", "/index.html", "/ui"):
+                # UI dilayani dari origin yang sama → tidak butuh CORS. Halaman statis, tanpa data rahasia.
+                try:
+                    body = WEB_UI.read_bytes()
+                except OSError:
+                    self._send_json(404, {"error": {"message": "web UI tidak ditemukan"}})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path == "/health":
                 act = pool.active
                 self._send_json(200, {
@@ -235,6 +251,7 @@ def run_server(pool: ModelPool, host: str, port: int, api_key: str | None = None
     print(f"   Active : {act.model_name} (arch={act.arch}, topK={act.active_top_k}, spec=k{act.max_spec}, baked={act.baked_toks} toks)")
     if len(pool.catalog) > 1:
         print(f"   Catalog: {', '.join(pool.catalog.keys())} (hot-swap enabled)")
+    print(f"   UI     : http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/  ← buka di browser")
     print(f"   Routes : /v1/chat/completions | /v1/models | /v1/state/bake | /health")
     print(f"   Auth   : {'API key aktif' if api_key else 'TANPA API key'} | CORS: {cors_origin or 'mati'} | "
           f"state-dir: {state_dir or '(bake ke file via HTTP mati)'}")

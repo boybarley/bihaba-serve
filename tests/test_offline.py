@@ -262,6 +262,13 @@ class TestHTTP(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def test_web_ui_served_same_origin(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=5) as r:
+            body = r.read().decode()
+            self.assertEqual(r.status, 200)
+            self.assertIn("text/html", r.headers["Content-Type"])
+        self.assertIn("/v1/chat/completions", body)
+
     def test_health_is_public(self):
         code, j = self.req("/health", key=None)
         self.assertEqual(code, 200)
