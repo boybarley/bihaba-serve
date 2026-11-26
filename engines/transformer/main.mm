@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <mach-o/dyld.h>
 #include <libgen.h>
 
@@ -873,7 +874,8 @@ struct TransformerEngine {
             exit(1);
         }
         memcpy([b_tok contents], ids, size_t(M) * sizeof(int32_t));
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        @autoreleasepool {
+        id<MTLCommandBuffer> cb = [queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
         QMVParams ep{dim, vocab, embed.gs_shift};
@@ -932,6 +934,7 @@ struct TransformerEngine {
             } else if (out_ids) {
                 memcpy(out_ids, [b_out_tok contents], size_t(HM) * sizeof(int32_t));
             }
+        }
         }
     }
 
@@ -1134,22 +1137,29 @@ static SpecStats generate_adaptive(
         }
         st.accepted += acc;
         int n_emit = int(emitted.size());
-        if (ord > 0 && M > 1) oa.update(ord, acc, was_rejected);
-        for (int i = 0; i < n_emit; ++i) eng.cached_ids.push_back(batch[i]);   // semua yang masuk KV
-
+        int n_keep = n_emit;
         for (int i = 0; i < n_emit; ++i) {
+            if ((!ignore_eos && eng.is_eos(emitted[i])) || int(st.tokens.size()) + i + 1 >= max_tokens) {
+                n_keep = i + 1;
+                break;
+            }
+        }
+        if (ord > 0 && M > 1) oa.update(ord, acc, was_rejected);
+        for (int i = 0; i < n_keep; ++i) eng.cached_ids.push_back(batch[i]);   // semua yang masuk KV
+
+        for (int i = 0; i < n_keep; ++i) {
             int32_t tok = emitted[i];
             st.tokens.push_back(tok); sfx.push(tok); nxt = tok;
             if (stream_stdout) { printf("{\"tok\":%d}\n", tok); fflush(stdout); }
-            if ((!ignore_eos && eng.is_eos(tok)) || int(st.tokens.size()) >= max_tokens) break;
         }
-        pos += n_emit;
+        pos += n_keep;
     }
     st.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - td0).count();
     return st;
 }
 
 int main(int argc, char** argv) {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     @autoreleasepool {
         if (argc < 2) {
             printf("Usage: %s <model_dir> [--bench 128] [--daemon] [--spec 7] [--max-seq 4096] [--prefill-chunk 128] [--rep-penalty 1.0]\n", argv[0]);

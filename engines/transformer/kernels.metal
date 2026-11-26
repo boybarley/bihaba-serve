@@ -707,6 +707,7 @@ inline void qmm_bk64_impl(
 }
 
 #define DECL_QMM(NAME, BITS, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
     device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
     constant QMVMultiParams& p [[buffer(5)]], \
@@ -786,6 +787,7 @@ inline void swiglu_bk64_impl(
 }
 
 #define DECL_SWIG_MMA(NAME, BITS, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], \
     device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
     device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
@@ -883,7 +885,7 @@ inline void qmm_gemm_impl(
         gemm_load_x(x, M, K, k0, Xs, tid);
         gemm_load_w<BITS>(w, scales, biases, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(c00, c01, c02, c03, c10, c11, c12, c13)
+        if (sm * 16 < M) { GEMM_MMA(c00, c01, c02, c03, c10, c11, c12, c13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float* cbuf = Cs + int(sg) * 64;
@@ -919,11 +921,11 @@ inline void swiglu_gemm_impl(
         gemm_load_x(x, M, K, k0, Xs, tid);
         gemm_load_w<BITS>(wg, sg_a, bg_a, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(g00, g01, g02, g03, g10, g11, g12, g13)
+        if (sm * 16 < M) { GEMM_MMA(g00, g01, g02, g03, g10, g11, g12, g13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         gemm_load_w<BITS>(wu, su_a, bu_a, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(u00, u01, u02, u03, u10, u11, u12, u13)
+        if (sm * 16 < M) { GEMM_MMA(u00, u01, u02, u03, u10, u11, u12, u13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float* gbuf = Cg_s + int(sg) * 64;
@@ -940,6 +942,7 @@ inline void swiglu_gemm_impl(
 }
 
 #define DECL_QMM_GEMM(NAME, BITS) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
     device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
     constant QMVMultiParams& p [[buffer(5)]], \
@@ -951,6 +954,7 @@ kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[
     qmm_gemm_impl<BITS>(x + ulong(mb) * ulong(p.K), w, s, b, out + ulong(mb) * ulong(p.N), q, Xs, Ws, Cs, tgp.x, tid, sg, lane); \
 }
 #define DECL_SWIG_GEMM(NAME, BITS) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], \
     device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
     device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
