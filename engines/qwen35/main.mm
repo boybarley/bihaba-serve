@@ -19,6 +19,8 @@
 #include <libgen.h>
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -29,6 +31,11 @@
 #include <random>
 #include <unordered_map>
 #include <vector>
+
+// SIGUSR1 dari daemon Python = hentikan generasi saat ini (stop sequence cocok / klien putus).
+// Handler hanya menyetel flag atomik; loop generasi memeriksanya tiap langkah.
+static std::atomic<bool> g_cancel{false};
+static void on_sigusr1(int) { g_cancel.store(true, std::memory_order_relaxed); }
 
 struct NormParams       { int32_t dim; float eps; };
 struct QMVParams        { int32_t K, N, gs_shift; };
@@ -300,6 +307,59 @@ struct Qwen35Engine {
     std::string arch_name, model_dir;
 
     QTensor embed, lm_head;
+    id<MTLComputePipelineState> pso_bw = nil;
+    double last_gpu_ms = 0.0;           // durasi GPU command buffer run_step terakhir
+
+    // ─── Roofline: byte yang WAJIB dibaca per token decode vs bandwidth memori terukur ───
+    static double qt_bytes(const QTensor& q) {
+        if (q.N <= 0 || q.K <= 0) return 0.0;
+        return double(q.N) * double(q.K) * q.bits / 8.0 + 2.0 * double(q.N) * double(q.K >> q.gs_shift) * 2.0;
+    }
+    double probe_bandwidth_gbs() {
+        if (!pso_bw) return 0.0;
+        const NSUInteger bytes = NSUInteger(1) << 30;            // 1 GiB: jauh lebih besar dari SLC
+        id<MTLBuffer> src = [dev newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+        const uint32_t threads = 64 * 1024;
+        id<MTLBuffer> out = [dev newBufferWithLength:threads * sizeof(float) options:MTLResourceStorageModePrivate];
+        if (!src || !out) return 0.0;
+        const uint32_t n4 = uint32_t(bytes / 16);
+        double best = 1e30;
+        for (int it = 0; it < 6; ++it) {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:pso_bw];
+            [e setBuffer:src offset:0 atIndex:0];
+            [e setBuffer:out offset:0 atIndex:1];
+            [e setBytes:&n4 length:sizeof(n4) atIndex:2];
+            [e dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e endEncoding];
+            [cb commit]; [cb waitUntilCompleted];
+            const double ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            if (it > 0 && ms > 0 && ms < best) best = ms;           // iterasi 0 = pemanasan
+        }
+        return best < 1e29 ? double(bytes) / (best * 1e6) : 0.0;
+    }
+
+    double decode_bytes_per_token(int pos) const {
+        double b = qt_bytes(lm_head);
+        for (int l = 0; l < n_layers; ++l) {
+            const LayerMeta& L = layers[size_t(l)];
+            if (L.type == 0) {
+                b += qt_bytes(L.in_qkv) + qt_bytes(L.in_z) + qt_bytes(L.in_a) + qt_bytes(L.in_b) + qt_bytes(L.out_p);
+                b += 2.0 * double(lin_vh) * lin_vhd * lin_khd * sizeof(float);   // state DeltaNet: baca + tulis
+            } else {
+                b += qt_bytes(L.q) + qt_bytes(L.k) + qt_bytes(L.v) + qt_bytes(L.o);
+                b += double(pos) * n_kv_heads * head_dim * 2.0 * 2.0;            // KV cache fp16 (K+V)
+            }
+            if (is_moe) {
+                b += qt_bytes(L.router) + qt_bytes(L.sh_gate) + qt_bytes(L.sh_gp) + qt_bytes(L.sh_up) + qt_bytes(L.sh_dp);
+                b += double(top_k) * (qt_bytes(L.moe_gp) + qt_bytes(L.moe_up) + qt_bytes(L.moe_dp));
+            } else {
+                b += qt_bytes(L.gate) + qt_bytes(L.up) + qt_bytes(L.down);
+            }
+        }
+        return b;
+    }
     BufSlice cos_s, sin_s, fnorm_s;
     std::vector<LayerMeta> layers;
 
@@ -437,9 +497,7 @@ struct Qwen35Engine {
                 fprintf(stderr, "Unsupported bits=%d for %s\n", q.bits, k.c_str()); exit(1);
             }
             if (is_switch) {
-                uint64_t kw = (q.bits == 4) ? uint64_t(q.K >> 3) :
-                              (q.bits == 2) ? uint64_t(q.K >> 4) :
-                              (q.bits == 8) ? uint64_t(q.K >> 2) : uint64_t((q.K * 3) >> 5);
+                const uint64_t kw = (uint64_t(q.K) * uint64_t(q.bits)) >> 5;   // kata uint32 per baris (2/3/4/6/8-bit)
                 q.stride_w = uint64_t(q.N) * kw;
                 q.stride_s = uint64_t(q.N) * uint64_t(q.K >> q.gs_shift);
             }
@@ -879,6 +937,7 @@ struct Qwen35Engine {
         pso_conv1d_prefill= make_pso(dev, lib, "deltanet_conv1d_silu_prefill", false, bf);
         pso_dn_prefill    = make_pso(dev, lib, "deltanet_recurrent_prefill",   false, bf);
         pso_argmax        = make_pso(dev, lib, "argmax_full",             false, bf);
+        pso_bw            = make_pso(dev, lib, "bw_probe",                false, bf);
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_dn_in4        = make_pso(dev, lib, "deltanet_in_proj_4b",     false, bf);
         pso_dn_in4_m1     = make_pso(dev, lib, "deltanet_in_proj_4b_m1",  false, bf);
@@ -1538,6 +1597,7 @@ struct Qwen35Engine {
         [cb commit];
         [cb waitUntilCompleted];
         if (gpu_ms_out) *gpu_ms_out = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        last_gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         if (run_head) {
             if (want_top64) {
                 int32_t* ids64 = (int32_t*)[b_top64_ids contents];
@@ -1813,7 +1873,7 @@ static SpecStats generate_adaptive(
     int32_t batch[8], out_ids[8];
     auto td0 = std::chrono::high_resolution_clock::now();
 
-    while ((ignore_eos || !eng.is_eos(nxt)) && int(st.tokens.size()) < max_tokens && pos < eng.max_seq - 9) {
+    while ((ignore_eos || !eng.is_eos(nxt)) && int(st.tokens.size()) < max_tokens && pos < eng.max_seq - 9 && !g_cancel.load(std::memory_order_relaxed)) {
         int rem = max_tokens - int(st.tokens.size());
         const int ord = (max_spec > 0) ? sfx.match_order() : 0;
         const int kk = ord ? std::min(choose_best_k(oa.alpha(ord), cost, max_spec), rem) : 0;
@@ -1898,6 +1958,11 @@ static SpecStats generate_adaptive(
 
 int main(int argc, char** argv) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    {   // SA_RESTART: read() stdin & write() stdout yang terinterupsi dilanjutkan, bukan gagal EINTR
+        struct sigaction sa{};
+        sa.sa_handler = on_sigusr1; sa.sa_flags = SA_RESTART; sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, nullptr);
+    }
     @autoreleasepool {
         if (argc < 2) {
             printf("Usage (Direct Zero-Copy ~/models/<dir> OR .taalas2 binary):\n");
@@ -1953,9 +2018,23 @@ int main(int argc, char** argv) {
             const RepRowsParams rp1{};
             int32_t tok = 9707;
             auto t0 = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < bench_toks; ++i) eng.run_step_m(&tok, 1, i, &tok, true, rp1);
+            double gpu_sum = 0.0;
+            for (int i = 0; i < bench_toks; ++i) { eng.run_step_m(&tok, 1, i, &tok, true, rp1); gpu_sum += eng.last_gpu_ms; }
             double ms1 = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
             printf("▸ Live Decode Bench (Greedy M=1):         %d toks in %.1f ms => %.1f tok/s\n", bench_toks, ms1, bench_toks * 1000.0 / ms1);
+
+            {   // Roofline: seberapa dekat decode M=1 ke batas fisik bandwidth memori
+                const double gbs = eng.probe_bandwidth_gbs();
+                const double mb_tok = eng.decode_bytes_per_token(bench_toks / 2) / 1e6;
+                const double eff_gbs = mb_tok * (bench_toks * 1000.0 / ms1) / 1e3;
+                if (gbs > 0)
+                    printf("▸ Roofline: %.0f MB/token → decode %.0f GB/s = %.0f%% dari bandwidth terukur %.0f GB/s (batas fisik ≈ %.0f tok/s)\n",
+                           mb_tok, eff_gbs, 100.0 * eff_gbs / gbs, gbs, gbs * 1e3 / mb_tok);
+                const double wall_tok = ms1 / bench_toks, gpu_tok = gpu_sum / bench_toks;
+                printf("▸ Waktu/token: total %.2f ms | GPU %.2f ms | CPU+sinkron %.2f ms (%.0f%%) | ideal-bandwidth %.2f ms\n",
+                       wall_tok, gpu_tok, wall_tok - gpu_tok, 100.0 * (wall_tok - gpu_tok) / wall_tok,
+                       gbs > 0 ? mb_tok / gbs : 0.0);
+            }
 
             // Prefill A/B: chunk 8 (perilaku lama) vs chunk aktif, prompt 512 token (token acak; hanya waktu yang diukur)
             {
@@ -2027,7 +2106,7 @@ int main(int argc, char** argv) {
         }
 
         if (daemon_mode) {
-            printf("{\"ready\":true,\"version\":\"v15\",\"arch\":\"%s\",\"model_dir\":\"%s\",\"top_k\":%d,\"max_spec\":%d,\"baked_toks\":%d,\"max_seq\":%d,\"prefill_chunk\":%d}\n",
+            printf("{\"ready\":true,\"cancel\":true,\"version\":\"v15\",\"arch\":\"%s\",\"model_dir\":\"%s\",\"top_k\":%d,\"max_spec\":%d,\"baked_toks\":%d,\"max_seq\":%d,\"prefill_chunk\":%d}\n",
                    eng.arch_name.c_str(), eng.model_dir.c_str(), eng.top_k, max_spec, eng.ram_snap.pos, eng.max_seq, eng.prefill_chunk);
             fflush(stdout);
             std::string line;
@@ -2110,6 +2189,7 @@ int main(int argc, char** argv) {
                 if (req[@"rep_penalty"]) sc.rep_pen     = [req[@"rep_penalty"] floatValue];
                 if (req[@"seed"])        sc.seed        = uint32_t([req[@"seed"] unsignedIntValue]);
 
+                g_cancel.store(false, std::memory_order_relaxed);
                 SpecStats st = generate_adaptive(eng, pids, prefix_len, mt, sp_k, sc, cost, true);
                 int n_dec = std::max(0, int(st.tokens.size()) - 1);
                 double tps = (st.decode_ms > 0.0) ? (n_dec * 1000.0 / st.decode_ms) : 0.0;

@@ -1,0 +1,6 @@
+*.align_tmp
+*.pyc
+*.tstate.tmp
+__pycache__/
+build/
+ai_bundle_*.txt

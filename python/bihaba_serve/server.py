@@ -44,6 +44,7 @@ def run_server(pool: ModelPool, host: str, port: int, api_key: str | None = None
                cors_origin: str | None = None, state_dir: str | None = None) -> None:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        disable_nagle_algorithm = True   # SSE berisi tulisan kecil: tanpa ini token tertahan & stream tersendat
 
         def log_message(self, fmt, *args):
             pass

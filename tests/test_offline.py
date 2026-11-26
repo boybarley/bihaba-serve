@@ -339,6 +339,7 @@ class TestDaemonDrain(unittest.TestCase):
         d.lock = threading.Lock()
         d.tok = _Tok()
         d.default_temp, d.default_rep_pen, d.baked_toks = 0.0, 1.0, 0
+        d.can_cancel = False
         try:
             g = d.stream_prompt_ids([1, 2, 3, 4, 5], max_tokens=10)
             self.assertEqual(next(g), {"delta": "a"})
@@ -393,6 +394,119 @@ class TestGenericDequant(unittest.TestCase):
             self.assertEqual(len(w), K * bits // 32)            # = row_words di kernel
             for k in range(0, K, 16):
                 self.assertEqual(dequant_gen16(w, k, bits), list(q[k:k + 16]), (bits, k))
+
+
+# ─── Streaming: detokenizer inkremental, filter stop, cache sesi token-eksak ──────────────────
+from bihaba_serve.daemon import EngineDaemon, StopFilter, StreamDecoder  # noqa: E402
+from bihaba_serve.templates import format_messages  # noqa: E402
+
+_SPECIAL = {"<|im_start|>": 1000, "<|im_end|>": 1001, "<think>": 1002, "</think>": 1003}
+_SPECIAL_INV = {v: k for k, v in _SPECIAL.items()}
+
+
+class _CharTok:
+    """Tokenizer mainan: token khusus utuh, karakter lain = ord(c). Cukup untuk logika prefix/LCP."""
+    template = "qwen35"
+    eos_ids = {1001}
+
+    def encode_raw(self, text):
+        out, i = [], 0
+        while i < len(text):
+            for sp, tid in _SPECIAL.items():
+                if text.startswith(sp, i):
+                    out.append(tid); i += len(sp); break
+            else:
+                out.append(ord(text[i])); i += 1
+        return out
+
+    def decode(self, ids):
+        return "".join(chr(t) for t in ids if t not in _SPECIAL_INV)
+
+    def token_id(self, text):
+        return _SPECIAL.get(text)
+
+    def format_chat_with_prefix(self, messages, enable_thinking=False):
+        sys_s, full = format_messages(messages, template=self.template, enable_thinking=enable_thinking)
+        return self.encode_raw(full), 0
+
+
+# Engine palsu dengan semantik cache yang sama dengan engine asli: state = prompt + token keluaran kecuali
+# yang terakhir; cache live dipakai hanya bila state lama adalah prefix utuh prompt baru.
+FAKE_CACHE_ENGINE = r"""
+import sys, json
+cached = []
+for line in sys.stdin:
+    req = json.loads(line)
+    pids = req["prompt_ids"]
+    reused = len(cached) if cached and pids[:len(cached)] == cached else 0
+    out = [ord(c) for c in "Halo!"] + [1001]
+    for t in out:
+        print(json.dumps({"tok": t}), flush=True)
+    cached = pids + out[:-1]
+    print(json.dumps({"done": True, "tokens": len(out), "reused": reused}), flush=True)
+"""
+
+
+class TestStreaming(unittest.TestCase):
+    def test_stop_filter_holds_partial_stop(self):
+        f = StopFilter(["\nUser:"])
+        sent = ""
+        for piece in ["Jawab", "an.\nUs", "er: lagi"]:
+            out, hit = f.feed(piece)
+            sent += out
+            if hit:
+                break
+        self.assertTrue(hit)
+        self.assertEqual(sent, "Jawaban.")          # potongan "\nUs" tidak pernah terkirim
+        g = StopFilter(["###"])
+        out, hit = g.feed("a#b#")
+        self.assertEqual((out, hit), ("a#b", False))
+        self.assertEqual(g.flush(), "#")
+
+    def test_context_overflow_is_clear_error(self):
+        d = object.__new__(EngineDaemon)
+        d.max_seq, d.default_temp, d.default_rep_pen = 32, 0.0, 1.0
+        evs = list(d.stream_prompt_ids(list(range(30)), max_tokens=1024))
+        self.assertEqual(len(evs), 1)
+        self.assertIn("--max-seq", evs[0]["error"])
+
+    def test_stream_decoder_matches_full_decode(self):
+        tok = _CharTok()
+        ids = tok.encode_raw("Halo dunia, apa kabar?")
+        d = StreamDecoder(tok)
+        self.assertEqual("".join(d.push(t) for t in ids), tok.decode(ids))
+
+    @unittest.skipIf(os.name == "nt", "butuh pipe POSIX")
+    def test_session_cache_hits_on_second_turn(self):
+        import subprocess
+        d = object.__new__(EngineDaemon)
+        d.proc = subprocess.Popen([sys.executable, "-c", FAKE_CACHE_ENGINE], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True, bufsize=1)
+        d.lock = threading.Lock()
+        d.tok = _CharTok()
+        d.default_temp, d.default_rep_pen, d.baked_toks = 0.0, 1.0, 0
+        d.enable_thinking, d.session_cache, d._sess, d.can_cancel = False, True, None, False
+        d._im_end = 1001
+        try:
+            conv = [{"role": "system", "content": "Kamu asisten."}, {"role": "user", "content": "Hai"}]
+            ev1 = list(d.stream_tokens(conv, max_tokens=50))
+            self.assertEqual(ev1[-1]["stats"]["reused"], 0)
+            # Klien mengirim balik jawaban (tanpa blok think, spasi dipangkas) + pesan baru
+            conv2 = conv + [{"role": "assistant", "content": " Halo! "}, {"role": "user", "content": "Apa kabar?"}]
+            # Bukti bug lama: render ulang kanonik TIDAK memuat state engine sebagai prefix
+            canon, _ = d.tok.format_chat_with_prefix(conv2)
+            first, _ = d.tok.format_chat_with_prefix(conv)
+            state = first + d.tok.encode_raw("Halo!")
+            self.assertNotEqual(canon[:len(state)], state)
+            ev2 = list(d.stream_tokens(conv2, max_tokens=50))
+            st = ev2[-1]["stats"]
+            self.assertTrue(st["session_hit"])
+            self.assertEqual(st["reused"], len(state))     # seluruh riwayat dipakai ulang, hanya ekor diproses
+            # Percakapan lain (riwayat berbeda) → tidak memakai sesi
+            ev3 = list(d.stream_tokens([{"role": "user", "content": "Topik baru"}], max_tokens=50))
+            self.assertFalse(ev3[-1]["stats"]["session_hit"])
+        finally:
+            d.proc.kill(); d.proc.wait(); d.proc.stdin.close(); d.proc.stdout.close()
 
 
 if __name__ == "__main__":

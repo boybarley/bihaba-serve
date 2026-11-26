@@ -37,18 +37,19 @@ All benchmarks measured directly from `.safetensors` directories (**0 GB disk du
 
 > **How to read the `Speculative k=7` column:** these numbers come from `bench`, whose prompt is a *synthetic repeating pattern* (the best case for n-gram drafting). On real chat/code the speedup depends on how repetitive the output is: typically 1.2–2× for code/JSON/RAG and ≈1× for free-form prose. The speculation is lossless (the output is identical to greedy), so it never makes quality worse.
 
-### v1.0 → v1.2 on the same machine (M1 Max 64 GB, same models, same session)
+### v1.0 → v1.5 on the same machine (M1 Max 64 GB, same models, same session)
 
-| Model | Metric | v1.0 | v1.2 | Gain |
+| Model | Metric | v1.0 | v1.5 | Gain |
 |---|---|---|---|---|
-| **Bihaba-AI-1.7B** (6-bit) | Prefill 512 tok | 275 tok/s | **765 tok/s** | 2.8× |
-| | Speculative k=7 (synthetic) | 232.7 tok/s | **457.5 tok/s** | 1.97× |
-| | Verify step M=8 | 32.0 ms | **16.8 ms** | 1.9× |
-| **Qwythos-9B** (4-bit, DeltaNet) | Prefill 512 tok | 104 tok/s | **241 tok/s** | 2.3× |
-| | Speculative k=7 (synthetic) | 141.3 tok/s | 141.3 tok/s | = |
-| **35B-A3B MoE** (`--top-k 4`) | Prefill 512 tok | 217 tok/s | **343 tok/s** | 1.58× |
-| | Speculative k=7 (synthetic) | 246.6 tok/s | 246.8 tok/s | = |
-| All | Greedy decode M=1 | | unchanged | = |
+| **Bihaba-AI-1.7B** (6-bit) | Prefill 512 tok | 275 tok/s | **1153 tok/s** | 4.2× (mlx-lm 0.29: 912) |
+| | Greedy decode | 132.6 tok/s | 132.4 tok/s | = (mlx-lm 0.29: 118.6) |
+| | Speculative k=7 (synthetic) | 232.7 tok/s | **457 tok/s** | 1.97× |
+| **Qwythos-9B** (4-bit, DeltaNet) | Prefill 512 tok | 104 tok/s | **279 tok/s** | 2.7× |
+| | Speculative k=7 (synthetic) | 141.3 tok/s | 141.4 tok/s | = |
+| **35B-A3B MoE** (`--top-k 4`) | Prefill 512 tok | 217 tok/s | **434 tok/s** | 2.0× |
+| | Speculative k=7 (synthetic) | 246.6 tok/s | 246.4 tok/s | = |
+
+**Multi-turn chat (v1.5 session cache, Qwythos-9B, real Web Console conversation):** the history (4–6k tokens) is reused, so TTFT stays at **0.31–0.35 s** instead of re-prefilling about 21 s each turn. On those real replies, speculative decoding accepted 4.7–6.3 tokens per step, giving 81–97 tok/s against 46 tok/s plain greedy.
 
 Every run reports `=greedy 128/128` (speculative output identical to greedy) and `Prefill check 32/32` (the GEMM prefill produces exactly the same greedy continuation as the v1.0 8-token path).
 
@@ -144,6 +145,35 @@ bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --profile --tok
 ```
 
 ---
+
+## What's new in v1.5
+
+**Server**
+- **Exact-token session cache:** a multi-turn conversation sends only the new message to the engine.
+  - Before, the empty `<think></think>` block of the qwen35 template was not reproduced when the history was re-rendered. The live cache therefore always missed, and the whole history was re-prefilled every turn.
+  - Disable with `--no-session-cache`.
+- **Generation is cancelled** (SIGUSR1) when a stop sequence matches or the client disconnects. Before, the engine kept generating until `max_tokens` while holding the lock.
+- **Incremental detokenizer:** streaming is O(n) instead of O(n²).
+- **Stop sequences** no longer leak partial matches to the client.
+- **SSE stream:** Nagle is disabled, so tokens are not held back.
+- **Context:** `max_tokens` is clamped to the remaining context, and `--max-seq` now defaults to 16384.
+- **Web Console:** "Clear bake" button and `POST /v1/state/clear`.
+
+**Engines**
+- **qwen35, from a collaborator's review:**
+  - fused DeltaNet/QKV MMA tiles are now per tensor (correct when a segment is not a multiple of 32);
+  - fixed a race on `sm_ss` between tokens in `deltanet_recurrent_spec`;
+  - emitted tokens are cut at EOS before the state commit, so the next turn's prefix still matches;
+  - bit-widths without kernels are rejected at load.
+- **Both engines:**
+  - USER_INTERACTIVE QoS;
+  - unretained command buffers plus an autoreleasepool per step;
+  - the GEMM skips empty half tiles.
+- **`bench` shows a roofline:**
+  - measured memory bandwidth;
+  - MB read per token;
+  - % of bandwidth used;
+  - GPU vs CPU time per token.
 
 ## What's new in v1.1 / v1.2
 

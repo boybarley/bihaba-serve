@@ -97,6 +97,9 @@ mlx-lm 0.29.1 menolak `qwen3_5` (Qwythos/MoE). Versi itu tertahan karena Python 
 | v1.2 | Kernel GEMM prefill 32×64, cek kebenaran prefill di bench |
 | v1.3 | Chunk prefill 128 + grid GEMM 2D |
 | v1.4 | Web Console bawaan di `/` (same-origin, tanpa CORS) |
+| v1.5-dev | Revisi kolaborator (qwen35) + port ke transformer: tile DN/QKV MMA per tensor (perbaiki batas segmen yang bukan kelipatan 32), race `sm_ss` antar-token di `deltanet_recurrent_spec`, emisi dipotong `n_keep` sebelum commit (cache prefix percakapan berikutnya tetap cocok), tolak bit-width tanpa kernel (qwen35 M=1: 2/3/4/8; expert MoE: 2/3/4), QoS USER_INTERACTIVE, command buffer unretained + autoreleasepool, GEMM lewati MMA untuk setengah tile kosong. Roofline + `qmv_4b_r4` A/B. |
+| v1.5-dev (2) | Review AI kolaborator: **cache sesi token-eksak** (multi-giliran tadinya selalu prefill ulang seluruh riwayat karena blok `<think></think>` kosong di template qwen35 tidak ikut dirender ulang → prefix pecah); **cancel SIGUSR1** saat stop sequence / klien putus (engine tadinya jalan sampai max_tokens sambil memegang lock); detokenizer inkremental (O(n) bukan O(n²)); stop filter menahan potongan stop; `disable_nagle_algorithm`. Flag `--no-session-cache`. |
+| **v1.5 (stabil)** | Semua di atas. `qmv_4b_r4` dihapus setelah A/B (hasil negatif, lihat bagian 7). |
 | v1.4.2 | `POST /v1/state/clear` + tombol "Hapus bake": buang snapshot system prompt dari RAM GPU |
 
 ---
@@ -145,3 +148,46 @@ Syarat lulus:
 - `=greedy 128/128`;
 - `Prefill check 32/32`;
 - tidak ada angka yang turun dibanding tabel di bagian 1.
+
+---
+
+## 7. Roofline decode (v1.5-dev, M1 Max, bandwidth terukur ≈ 322–327 GB/s)
+
+| Model | MB/token | Decode | % bandwidth | Waktu/token | GPU | CPU+sinkron | Ideal |
+|---|---|---|---|---|---|---|---|
+| MNN-Pocket 0.3B (4-bit) | 171 | 331 tok/s | **18%** | 3.02 ms | 2.56 | 0.47 (15%) | 0.53 ms |
+| Bihaba-AI 1.7B (6-bit) | 1405 | 132 tok/s | 58% | 7.56 ms | 7.08 | 0.48 (6%) | 4.36 ms |
+| Qwythos-9B (4-bit) | 4567 | 46.3 tok/s | 65% | 21.58 ms | 21.03 | 0.55 (3%) | 14.11 ms |
+| MoE 35B-A3B top-k 4 | 1511 | 98.4 tok/s | 46% | 10.16 ms | 9.51 | 0.65 (6%) | 4.63 ms |
+
+Kesimpulan:
+- **CPU/sinkron bukan masalah utama** (3–15%). Sumber kerugian terbesar adalah waktu GPU, yaitu 1.5–4.8× di atas waktu ideal.
+- **Ada overhead tetap per layer sekitar 70–120 µs:**
+  - 10 dispatch dan 8 barrier per layer transformer;
+  - fase kecil yang tidak mengisi GPU (RMSNorm satu threadgroup, rope, attention per head);
+  - ekor (tail) tiap kernel.
+
+  Overhead ini mendominasi model kecil (0.3B: 18%).
+- **Kernel matriks besar pun tidak penuh.** Di Qwythos, FFN M=1 butuh 12.7 ms vs ideal sekitar 8.4 ms (≈66%), sedangkan head 248K efisien (≈89%).
+  - Hipotesis: qmv v1 hanya 2 baris × 8 byte per lane, sehingga terlalu sedikit load yang berjalan bersamaan.
+  - Diuji dengan `qmv_4b_r4` (A/B otomatis di bench).
+- **Rencana berikutnya, berdasarkan data:**
+  1. qmv lebih lebar (r4) untuk semua bit-width;
+  2. fusi RMSNorm ke proyeksi berikutnya dan fusi QKV satu dispatch (8 → 5 barrier per layer);
+  3. decode loop di GPU (token tidak kembali ke CPU) untuk greedy/sampling GPU.
+
+### Hasil A/B `qmv_4b_r4` (hasil negatif, kernel dihapus di v1.5)
+Kernel ini menangani 4 baris per simdgroup dengan 16 byte per lane. Hasilnya: Qwythos 46.3 → 46.2 tok/s, 1.7B tidak terpengaruh (6-bit), 0.3B −3%, MoE −6%. Greedy identik di semua model.
+- **Kesimpulan:** hipotesis "load kurang paralel" salah. Kerugian di qmv M=1 bukan soal jumlah byte yang dibaca bersamaan.
+- **Penjelasan yang tersisa:** overhead per dispatch/barrier dan ekor (tail) kernel per fase.
+- **Langkah berikutnya:** fusi kernel (RMSNorm ke proyeksi, satu dispatch QKV, combine+residual+norm), bukan kernel matvec yang lebih lebar.
+
+### Cache sesi di engine asli (Qwythos-9B, Web Console, Greedy)
+| Riwayat dipakai ulang | TTFT | prefill ekor | Decode | token/langkah |
+|---|---|---|---|---|
+| 4.265 tok | 351 ms | 335 ms | 81.3 tok/s | 4.65 |
+| 5.307 tok | 325 ms | 303 ms | 90.1 tok/s | 5.48 |
+| 5.885 tok | 311 ms | 287 ms | 97.3 tok/s | 6.34 |
+
+- **Tanpa cache:** sekitar 21 detik per giliran (5.9k token dengan laju 279 tok/s).
+- **Catatan:** prefill ekor sekitar 300 ms untuk puluhan token masih mahal. Penyebabnya attention prefill naif yang membaca seluruh riwayat per token. Ini kandidat berikutnya: attention ber-tile (flash-attention MMA).

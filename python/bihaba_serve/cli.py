@@ -95,7 +95,7 @@ def main() -> None:
     p_srv.add_argument("--models-dir", default=None, help="Scan directory for multi-model hot-swap (/v1/models)")
     p_srv.add_argument("--top-k", type=int, default=0, help="Override MoE active experts (e.g. 4)")
     p_srv.add_argument("--spec", type=int, default=7, help="Max speculative draft tokens (0..7)")
-    p_srv.add_argument("--max-seq", type=int, default=4096)
+    p_srv.add_argument("--max-seq", type=int, default=16384)
     p_srv.add_argument("--temp", type=float, default=0.6)
     p_srv.add_argument("--rep-penalty", type=float, default=1.0,
                        help="1.0 = mati (default). >1 merusak kode/JSON & menurunkan penerimaan spekulasi")
@@ -110,12 +110,14 @@ def main() -> None:
                        help="Wajibkan 'Authorization: Bearer <key>' (atau env BIHABA_API_KEY)")
     p_srv.add_argument("--cors", default=None, help="Aktifkan CORS untuk origin ini, mis. '*' atau 'http://localhost:3000'")
     p_srv.add_argument("--state-dir", default=None, help="Folder tempat POST /v1/state/bake boleh menyimpan .tstate")
+    p_srv.add_argument("--no-session-cache", action="store_true",
+                       help="Matikan cache sesi token-eksak (riwayat dirender ulang sesuai template kanonik tiap giliran)")
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat")
     p_chat.add_argument("--model", required=True)
     p_chat.add_argument("--top-k", type=int, default=0)
     p_chat.add_argument("--spec", type=int, default=7)
-    p_chat.add_argument("--max-seq", type=int, default=4096)
+    p_chat.add_argument("--max-seq", type=int, default=16384)
     p_chat.add_argument("--temp", type=float, default=0.6)
     p_chat.add_argument("--rep-penalty", type=float, default=1.0)
     p_chat.add_argument("--prefill-chunk", type=int, default=128)
@@ -208,6 +210,7 @@ def main() -> None:
             rep_penalty=args.rep_penalty, enable_thinking=args.thinking,
             top_k_moe=args.top_k, max_spec=args.spec, max_seq=args.max_seq,
             load_state=args.load_state, default_temp=args.temp, prefill_chunk=args.prefill_chunk,
+            session_cache=not args.no_session_cache,
         )
         if sys_text and not args.load_state and pool.active:
             res = pool.active.bake_system_prompt(sys_text, None)

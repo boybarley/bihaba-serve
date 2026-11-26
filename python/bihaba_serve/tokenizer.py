@@ -50,6 +50,13 @@ class ResilientTokenizer:
         prefix_len = len(sys_ids) if len(sys_ids) >= 16 else 0
         return full_ids, prefix_len
 
+    def token_id(self, text: str) -> int | None:
+        try:
+            tid = self._tok.token_to_id(text) if self._mode == "fast_raw" else self._tok.convert_tokens_to_ids(text)
+        except Exception:
+            return None
+        return int(tid) if tid is not None and tid >= 0 else None
+
     def decode(self, ids: list[int]) -> str:
         clean = [t for t in ids if t not in self.eos_ids]
         return self._tok.decode(clean, skip_special_tokens=True)

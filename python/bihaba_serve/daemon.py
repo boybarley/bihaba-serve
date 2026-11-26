@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import signal
 import subprocess
 import threading
 import time
@@ -12,7 +14,72 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .detector import ModelInfo, detect_model, scan_models_dir
+from .templates import _flatten_content, format_messages
 from .tokenizer import ResilientTokenizer
+
+_THINK_RE = re.compile(r"^.*?</think>", re.S)
+
+
+def _norm_assistant(text: str) -> str:
+    """Bentuk pembanding jawaban: klien biasanya membuang blok <think> dan spasi tepi."""
+    return _THINK_RE.sub("", text, count=1).strip()
+
+
+def _msg_key(messages: list[dict]) -> list[tuple[str, str]]:
+    out = []
+    for m in messages:
+        role = m.get("role", "user")
+        text = _flatten_content(m.get("content", ""))
+        out.append((role, _norm_assistant(text) if role == "assistant" else text))
+    return out
+
+
+class StreamDecoder:
+    """Detokenizer inkremental: O(panjang token baru), bukan decode ulang seluruh jawaban tiap token.
+    Menahan potongan UTF-8 yang belum lengkap (karakter pengganti di ujung)."""
+
+    def __init__(self, tok):
+        self.tok, self.ids, self.prefix, self.read = tok, [], 0, 0
+
+    def push(self, tid: int) -> str:
+        self.ids.append(tid)
+        prev = self.tok.decode(self.ids[self.prefix:self.read])
+        cur = self.tok.decode(self.ids[self.prefix:])
+        if len(cur) > len(prev) and not cur.endswith("\ufffd"):
+            self.prefix, self.read = self.read, len(self.ids)
+            return cur[len(prev):]
+        return ""
+
+
+class StopFilter:
+    """Menahan ekor teks yang bisa menjadi awal stop sequence, agar potongan stop tidak terlanjur terkirim."""
+
+    def __init__(self, stops: list[str]):
+        self.stops = [s for s in stops if s]
+        self.pending = ""
+
+    def feed(self, delta: str) -> tuple[str, bool]:
+        """→ (teks aman untuk dikirim, berhenti?)"""
+        if not self.stops:
+            return delta, False
+        self.pending += delta
+        hits = [i for i in (self.pending.find(s) for s in self.stops) if i != -1]
+        if hits:
+            out, self.pending = self.pending[:min(hits)], ""
+            return out, True
+        hold = 0
+        for s in self.stops:
+            for k in range(min(len(s) - 1, len(self.pending)), 0, -1):
+                if self.pending.endswith(s[:k]):
+                    hold = max(hold, k)
+                    break
+        out = self.pending[:len(self.pending) - hold]
+        self.pending = self.pending[len(self.pending) - hold:]
+        return out, False
+
+    def flush(self) -> str:
+        out, self.pending = self.pending, ""
+        return out
 
 
 def find_engine_binary(engine_name: str, repo_root: Path) -> Path:
@@ -38,12 +105,15 @@ class EngineDaemon:
         enable_thinking: bool = False,
         top_k_moe: int = 0,
         max_spec: int = 7,
-        max_seq: int = 4096,
+        max_seq: int = 16384,
         load_state: str | None = None,
         default_temp: float = 0.0,
         prefill_chunk: int = 128,
+        session_cache: bool = True,
     ):
         self.info = model_info
+        self.session_cache = session_cache
+        self._sess: dict | None = None
         self.enable_thinking = enable_thinking
         self.default_temp = default_temp
         self.default_rep_pen = rep_penalty
@@ -79,8 +149,19 @@ class EngineDaemon:
         self.max_spec = meta.get("max_spec", max_spec)
         self.baked_toks = meta.get("baked_toks", 0)
         self.max_seq = int(meta.get("max_seq", max_seq))
+        self.can_cancel = bool(meta.get("cancel", False))   # engine lama tanpa handler SIGUSR1 → jangan kirim sinyal
+        self._im_end = self.tok.token_id("<|im_end|>")
+
+    def _cancel(self) -> None:
+        """Hentikan generasi engine sekarang (stop sequence cocok / klien putus), bukan menunggu max_tokens."""
+        if self.can_cancel and self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, signal.SIGUSR1)
+            except OSError:
+                pass
 
     def close(self) -> None:
+        self._sess = None
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.stdin.close()
@@ -116,6 +197,7 @@ class EngineDaemon:
             res = json.loads(line)
             if res.get("cleared"):
                 self.baked_toks = 0
+                self._sess = None
             return res
 
     def stream_prompt_ids(
@@ -131,6 +213,14 @@ class EngineDaemon:
         seed: int | None = None,
         stop: list[str] | None = None,
     ):
+        # Sesuaikan max_tokens dengan sisa konteks (seperti API OpenAI): percakapan panjang tidak gagal hanya
+        # karena max_tokens default terlalu besar. Gagal hanya bila prompt sendiri tidak muat.
+        room = int(getattr(self, "max_seq", 1 << 30)) - len(prompt_ids) - 9
+        if room < 1:
+            yield {"error": f"Percakapan ({len(prompt_ids)} token) melebihi konteks maksimal engine ({self.max_seq} token). "
+                            "Mulai percakapan baru, atau jalankan server dengan --max-seq lebih besar (mis. 32768)."}
+            return
+        max_tokens = max(1, min(int(max_tokens), room))
         temp = self.default_temp if temperature is None else float(temperature)
         rp = self.default_rep_pen if rep_penalty is None else float(rep_penalty)
         payload: dict = {
@@ -154,9 +244,9 @@ class EngineDaemon:
                 return
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
-            acc_ids: list[int] = []
             raw_ids: list[int] = []
-            emitted_text = ""
+            dec = StreamDecoder(self.tok)
+            stopper = StopFilter(stop_seqs)
             stopped_early = False
             finished = False
             try:
@@ -172,38 +262,32 @@ class EngineDaemon:
                         raw_ids.append(tid)
                         if stopped_early or tid in self.tok.eos_ids:
                             continue
-                        acc_ids.append(tid)
-                        full = self.tok.decode(acc_ids)
-                        if stop_seqs:
-                            for sseq in stop_seqs:
-                                idx = full.find(sseq)
-                                if idx != -1:
-                                    delta = full[len(emitted_text):idx]
-                                    emitted_text = full[:idx]
-                                    if delta:
-                                        yield {"delta": delta}
-                                    stopped_early = True
-                                    break
-                            if stopped_early:
-                                continue
-                        delta = full[len(emitted_text):]
-                        emitted_text = full
-                        if delta:
-                            yield {"delta": delta}
+                        out, hit = stopper.feed(dec.push(tid))
+                        if out:
+                            yield {"delta": out}
+                        if hit:
+                            stopped_early = True
+                            self._cancel()
                     elif obj.get("done"):
                         finished = True
                         if obj.get("error"):
                             yield {"error": obj["error"]}
                             break
+                        if not stopped_early:
+                            tail = stopper.flush()
+                            if tail:
+                                yield {"delta": tail}
                         self.baked_toks = int(obj.get("baked_toks", self.baked_toks))
                         obj["prompt_tokens"] = len(prompt_ids)
                         obj["finish_reason"] = "stop" if stopped_early or (raw_ids and raw_ids[-1] in self.tok.eos_ids) \
                             else ("length" if obj.get("tokens", 0) + 1 >= max_tokens else "stop")
-                        yield {"done": True, "stats": obj, "raw_ids": raw_ids}
+                        yield {"done": True, "stats": obj, "raw_ids": raw_ids, "stopped_early": stopped_early}
                         break
             finally:
                 # Klien putus / generator ditutup sebelum engine selesai: buang sisa output sampai baris "done".
                 # Tanpa ini, token sisa terbaca oleh request BERIKUTNYA (respons tercampur).
+                if not finished:
+                    self._cancel()
                 while not finished:
                     line = self.proc.stdout.readline()
                     if not line:
@@ -214,9 +298,45 @@ class EngineDaemon:
                     except ValueError:
                         break
 
+    def _session_prompt(self, messages: list[dict], key: list[tuple[str, str]]):
+        """Giliran lanjutan dari percakapan yang sama → id token PERSIS giliran lalu + ekor baru.
+
+        Kenapa: state engine berisi token yang benar-benar diproses (termasuk blok <think></think> kosong
+        dari template qwen35 dan tokenisasi jawaban apa adanya). Merender ulang riwayat sebagai teks
+        menghasilkan token berbeda di titik itu → cache live engine selalu gagal → seluruh riwayat
+        di-prefill ulang tiap giliran. Dengan id persis, engine hanya memproses pesan baru."""
+        s = self._sess
+        if not (s and len(key) > len(s["key"]) and key[:len(s["key"])] == s["key"]):
+            return None
+        _, tail = format_messages(messages[len(s["key"]):], template=self.tok.template,
+                                  enable_thinking=self.enable_thinking)
+        return s["ids"] + self.tok.encode_raw("\n" + tail), s["prefix_len"]
+
     def stream_tokens(self, messages: list[dict], **kwargs):
-        prompt_ids, prefix_len = self.tok.format_chat_with_prefix(messages, enable_thinking=self.enable_thinking)
-        yield from self.stream_prompt_ids(prompt_ids, prefix_len=prefix_len, **kwargs)
+        chatml = self.tok.template != "llama3" and self._im_end is not None
+        use_sess = self.session_cache and chatml and not self.enable_thinking
+        key = _msg_key(messages) if use_sess else []
+        hit = self._session_prompt(messages, key) if use_sess else None
+        if hit:
+            prompt_ids, prefix_len = hit
+        else:
+            prompt_ids, prefix_len = self.tok.format_chat_with_prefix(messages, enable_thinking=self.enable_thinking)
+        self._sess = None
+        text: list[str] = []
+        for ev in self.stream_prompt_ids(prompt_ids, prefix_len=prefix_len, **kwargs):
+            if "delta" in ev:
+                text.append(ev["delta"])
+            elif ev.get("done") and use_sess and not ev.get("stopped_early"):
+                raw = list(ev.get("raw_ids") or [])
+                if raw and raw[-1] in self.tok.eos_ids:
+                    raw = raw[:-1]
+                # Engine menyimpan prompt + raw[:-1] (token terakhir belum jadi input). Giliran berikut diawali
+                # <|im_end|> → id sesi = prompt + raw + <|im_end|>, selalu memuat state engine sebagai prefix.
+                self._sess = {"key": key + [("assistant", _norm_assistant("".join(text)))],
+                              "ids": prompt_ids + raw + [self._im_end], "prefix_len": prefix_len}
+            if "stats" in ev:
+                ev["stats"]["session_hit"] = bool(hit)
+            yield ev
 
 
 class ModelPool:

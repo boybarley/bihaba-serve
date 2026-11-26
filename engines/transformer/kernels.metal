@@ -1298,3 +1298,12 @@ kernel void topk_logits_64(
         }
     }
 }
+
+// ─────────────────────── Probe bandwidth: baca buffer besar sekali, ukur GB/s nyata ───────────────────────
+kernel void bw_probe(device const float4* src [[buffer(0)]], device float* out [[buffer(1)]],
+                     constant uint& n4 [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]], uint gsz [[threads_per_grid]]) {
+    float4 acc = float4(0.0f);
+    for (uint i = gid; i < n4; i += gsz) acc += src[i];
+    out[gid] = acc.x + acc.y + acc.z + acc.w;
+}
