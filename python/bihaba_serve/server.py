@@ -148,6 +148,12 @@ def run_server(pool: ModelPool, host: str, port: int, api_key: str | None = None
             if req is None:
                 return
 
+            if self.path == "/v1/state/clear":
+                with pool.session(req.get("model")) as daemon:
+                    res = daemon.clear_state()
+                self._send_json(200 if res.get("cleared") else 400, res)
+                return
+
             if self.path == "/v1/state/bake":
                 path, err = _state_file(state_dir, req.get("path") or req.get("name"))
                 if err:
@@ -252,7 +258,7 @@ def run_server(pool: ModelPool, host: str, port: int, api_key: str | None = None
     if len(pool.catalog) > 1:
         print(f"   Catalog: {', '.join(pool.catalog.keys())} (hot-swap enabled)")
     print(f"   UI     : http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/  ← buka di browser")
-    print(f"   Routes : /v1/chat/completions | /v1/models | /v1/state/bake | /health")
+    print(f"   Routes : /v1/chat/completions | /v1/models | /v1/state/bake | /v1/state/clear | /health")
     print(f"   Auth   : {'API key aktif' if api_key else 'TANPA API key'} | CORS: {cors_origin or 'mati'} | "
           f"state-dir: {state_dir or '(bake ke file via HTTP mati)'}")
     if exposed and not api_key:

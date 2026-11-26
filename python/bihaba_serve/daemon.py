@@ -105,6 +105,19 @@ class EngineDaemon:
                 self.baked_toks = int(res.get("tokens", 0))
             return res
 
+    def clear_state(self) -> dict:
+        """Hapus snapshot system prompt di RAM GPU (hasil bake/auto-bake) + cache percakapan."""
+        with self.lock:
+            self.proc.stdin.write(json.dumps({"cmd": "clear_state"}) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+            if not line:
+                return {"cleared": False, "error": "engine berhenti"}
+            res = json.loads(line)
+            if res.get("cleared"):
+                self.baked_toks = 0
+            return res
+
     def stream_prompt_ids(
         self,
         prompt_ids: list[int],

@@ -210,6 +210,7 @@ canvas{width:100%;height:56px;display:block}
         <textarea id="system" placeholder="Kamu adalah asisten yang ringkas dan akurat."></textarea>
         <div class="btnrow">
           <button class="btn primary" id="bake" title="Prefill system prompt sekali ke RAM GPU → TTFT berikutnya jauh lebih cepat">⚡ Bake ke GPU</button>
+          <button class="btn" id="unbake" title="Hapus snapshot system prompt dari RAM GPU">✕ Hapus bake</button>
         </div>
       </div>
     </section>
@@ -594,6 +595,12 @@ $("bake").onclick = async () => {
   setStatus("busy", "bake…");
   try { const r = await api("/v1/state/bake", { system: sys, model: $("model").value || undefined }); toast(`⚡ ${r.tokens ?? "?"} token di-bake ke GPU`); }
   catch (e) { toast("Bake gagal: " + e.message); }
+  refreshHealth();
+};
+$("unbake").onclick = async () => {
+  if (busy) return;
+  try { const r = await api("/v1/state/clear", {}); toast(`Snapshot dihapus (${r.mb ?? 0} MB dibebaskan)`); }
+  catch (e) { toast("Gagal menghapus: " + e.message); }
   refreshHealth();
 };
 $("system").value = store.get("system", "");

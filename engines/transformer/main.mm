@@ -1256,6 +1256,15 @@ int main(int argc, char** argv) {
                 if (!req) continue;
 
                 NSString* cmd = req[@"cmd"];
+                if (cmd && [cmd isEqualToString:@"clear_state"]) {
+                    // Buang snapshot prefix di RAM + cache percakapan. File .tstate di disk tidak disentuh.
+                    const double freed = eng.ram_snap.bytes() / 1e6;
+                    eng.ram_snap = StateSnapshot{};
+                    eng.reset_states();
+                    printf("{\"cleared\":true,\"mb\":%.1f}\n", freed);
+                    fflush(stdout);
+                    continue;
+                }
                 if (cmd && [cmd isEqualToString:@"bake"]) {
                     std::vector<int32_t> pids;
                     for (NSNumber* num in req[@"prompt_ids"]) pids.push_back([num intValue]);

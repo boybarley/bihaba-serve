@@ -205,6 +205,9 @@ class _FakeDaemon:
         self.baked_paths.append(path)
         return {"baked": True, "tokens": 3}
 
+    def clear_state(self):
+        return {"cleared": True, "mb": 70.9}
+
     def stream_tokens(self, messages, **kw):
         if messages[-1].get("content") == "boom":
             yield {"error": "prompt terlalu panjang"}
@@ -292,6 +295,12 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(self.req("/v1/chat/completions", raw=b"[1,2]")[0], 400)
         self.assertEqual(self.req("/v1/chat/completions", {"messages": []})[0], 400)
         self.assertEqual(self.req("/v1/chat/completions", {"messages": [{"content": "x"}], "max_tokens": "abc"})[0], 400)
+
+    def test_clear_state(self):
+        self.assertEqual(self.req("/v1/state/clear", {}, key=None)[0], 401)
+        code, j = self.req("/v1/state/clear", {})
+        self.assertEqual(code, 200)
+        self.assertTrue(j["cleared"])
 
     def test_bake_confined_to_state_dir(self):
         code, _ = self.req("/v1/state/bake", {"system": "x", "path": "../../../tmp/pwn"})
