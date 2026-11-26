@@ -232,6 +232,11 @@ static inline uint64_t fnv1a(uint64_t h, const void* data, size_t n) {
 
 // Kernel mengasumsikan grup kuantisasi 32/64 dan K kelipatan 16 (3-bit: 32). Model di luar itu akan
 // menghasilkan teks rusak tanpa error, jadi tolak sejak load.
+// Ambang M untuk jalur MMA. 4/2-bit: dekuantisasi bit-trick murah → MMA menang mulai M=4.
+// 3/6/8-bit: dekuantisasi generik lebih mahal, biayanya ~tetap per M (M1 Max: 6-bit n4=23.1ms MMA vs 18.6ms qmv,
+// n6=22.8ms vs 25.3ms) → MMA baru menang mulai M=6.
+static inline int mma_min_m(int bits) { return (bits == 4 || bits == 2) ? 4 : 6; }
+
 static void check_qtensor(const char* name, int bits, int gs, int K, int N) {
     const bool ok = (gs == 32 || gs == 64) && K > 0 && N > 0 && (K % gs) == 0 && (K % (bits == 3 ? 32 : 16)) == 0;
     if (!ok) {
@@ -769,7 +774,7 @@ struct TransformerEngine {
         id<MTLComputePipelineState> pso; int rows_per_tg; bool multi = true;
         if (M == 1) {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
-        } else if (M >= 4 && mma_ok) {
+        } else if (M >= mma_min_m(qt.bits) && mma_ok) {
             pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
             rows_per_tg = 32;
         } else {
@@ -792,7 +797,7 @@ struct TransformerEngine {
             return;
         }
         QMVMultiParams p{M, gp.K, gp.N, gp.gs_shift};
-        const bool use_mma = (M >= 4 && mma_ok);
+        const bool use_mma = (M >= mma_min_m(gp.bits) && mma_ok);
         id<MTLComputePipelineState> pso = use_mma
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
