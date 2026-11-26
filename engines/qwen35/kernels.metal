@@ -880,6 +880,7 @@ inline void qmm_bk64_impl(
 }
 
 #define DECL_QMM(NAME, BITS, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
     device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
     constant QMVMultiParams& p [[buffer(5)]], \
@@ -901,6 +902,7 @@ DECL_QMM(qmm_8b_mma8, 8, 1)
 DECL_QMM(qmm_8b_mmaP, 8, 4)
 
 #define DECL_DN_IN_MMA(NAME, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME( \
     device const half* x [[buffer(0)]], \
     device const uint32_t* w_qkv [[buffer(1)]], device const ushort* s_qkv [[buffer(2)]], device const ushort* b_qkv [[buffer(3)]], \
@@ -912,23 +914,25 @@ kernel void NAME( \
     uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
 { \
-    const int g_base = int(tg_x) * 32; \
-    const int c0 = p.n_qkv, c1 = c0 + p.n_z, c2 = c1 + p.n_a, c3 = c2 + p.n_b; \
-    if (g_base >= c3) return; \
+    const int t0 = (p.n_qkv + 31) >> 5, t1 = t0 + ((p.n_z + 31) >> 5), \
+              t2 = t1 + ((p.n_a + 31) >> 5), t3 = t2 + ((p.n_b + 31) >> 5); \
+    const int t = int(tg_x); \
+    if (t >= t3) return; \
     device const uint32_t* wp; device const ushort *sp, *bp; device half* op; \
-    int row_base, N; \
-    if (g_base < c0)      { wp = w_qkv; sp = s_qkv; bp = b_qkv; op = o_qkv; row_base = g_base;      N = p.n_qkv; } \
-    else if (g_base < c1) { wp = w_z;   sp = s_z;   bp = b_z;   op = o_z;   row_base = g_base - c0; N = p.n_z;   } \
-    else if (g_base < c2) { wp = w_a;   sp = s_a;   bp = b_a;   op = o_a;   row_base = g_base - c1; N = p.n_a;   } \
-    else                  { wp = w_b;   sp = s_b;   bp = b_b;   op = o_b;   row_base = g_base - c2; N = p.n_b;   } \
+    int tile_idx, N; \
+    if (t < t0)      { wp = w_qkv; sp = s_qkv; bp = b_qkv; op = o_qkv; tile_idx = t;      N = p.n_qkv; } \
+    else if (t < t1) { wp = w_z;   sp = s_z;   bp = b_z;   op = o_z;   tile_idx = t - t0; N = p.n_z;   } \
+    else if (t < t2) { wp = w_a;   sp = s_a;   bp = b_a;   op = o_a;   tile_idx = t - t1; N = p.n_a;   } \
+    else             { wp = w_b;   sp = s_b;   bp = b_b;   op = o_b;   tile_idx = t - t2; N = p.n_b;   } \
     threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64]; \
     QMVMultiParams mp{p.M, p.K, N, p.gs_shift}; \
-    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane); \
+    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(tile_idx), tid, sg, lane); \
 }
 DECL_DN_IN_MMA(deltanet_in_proj_4b_mma8, 1)
 DECL_DN_IN_MMA(deltanet_in_proj_4b_mmaP, 4)
 
 #define DECL_QKV_MMA(NAME, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME( \
     device const half* x [[buffer(0)]], \
     device const uint32_t* w_q [[buffer(1)]], device const ushort* s_q [[buffer(2)]], device const ushort* b_q [[buffer(3)]], \
@@ -939,17 +943,17 @@ kernel void NAME( \
     uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
 { \
-    const int g_base = int(tg_x) * 32; \
-    const int c0 = p.n_q, c1 = c0 + p.n_k, c2 = c1 + p.n_v; \
-    if (g_base >= c2) return; \
+    const int t0 = (p.n_q + 31) >> 5, t1 = t0 + ((p.n_k + 31) >> 5), t2 = t1 + ((p.n_v + 31) >> 5); \
+    const int t = int(tg_x); \
+    if (t >= t2) return; \
     device const uint32_t* wp; device const ushort *sp, *bp; device half* op; \
-    int row_base, N; \
-    if (g_base < c0)      { wp = w_q; sp = s_q; bp = b_q; op = o_q; row_base = g_base;      N = p.n_q; } \
-    else if (g_base < c1) { wp = w_k; sp = s_k; bp = b_k; op = o_k; row_base = g_base - c0; N = p.n_k; } \
-    else                  { wp = w_v; sp = s_v; bp = b_v; op = o_v; row_base = g_base - c1; N = p.n_v; } \
+    int tile_idx, N; \
+    if (t < t0)      { wp = w_q; sp = s_q; bp = b_q; op = o_q; tile_idx = t;      N = p.n_q; } \
+    else if (t < t1) { wp = w_k; sp = s_k; bp = b_k; op = o_k; tile_idx = t - t0; N = p.n_k; } \
+    else             { wp = w_v; sp = s_v; bp = b_v; op = o_v; tile_idx = t - t1; N = p.n_v; } \
     threadgroup half Xs[8 * MT * 64], Ws[32 * 72]; threadgroup float Cs[4 * 64]; \
     QMVMultiParams mp{p.M, p.K, N, p.gs_shift}; \
-    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(row_base / 32), tid, sg, lane); \
+    qmm_bk64_impl<4, MT>(x, wp, sp, bp, op, mp, Xs, Ws, Cs, uint(tile_idx), tid, sg, lane); \
 }
 DECL_QKV_MMA(q35_qkv_proj_4b_mma8, 1)
 DECL_QKV_MMA(q35_qkv_proj_4b_mmaP, 4)
@@ -1013,6 +1017,7 @@ inline void swiglu_bk64_impl(
 }
 
 #define DECL_SWIG_MMA(NAME, BITS, MT) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], \
     device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
     device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
@@ -1110,7 +1115,7 @@ inline void qmm_gemm_impl(
         gemm_load_x(x, M, K, k0, Xs, tid);
         gemm_load_w<BITS>(w, scales, biases, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(c00, c01, c02, c03, c10, c11, c12, c13)
+        if (sm * 16 < M) { GEMM_MMA(c00, c01, c02, c03, c10, c11, c12, c13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float* cbuf = Cs + int(sg) * 64;
@@ -1146,11 +1151,11 @@ inline void swiglu_gemm_impl(
         gemm_load_x(x, M, K, k0, Xs, tid);
         gemm_load_w<BITS>(wg, sg_a, bg_a, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(g00, g01, g02, g03, g10, g11, g12, g13)
+        if (sm * 16 < M) { GEMM_MMA(g00, g01, g02, g03, g10, g11, g12, g13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         gemm_load_w<BITS>(wu, su_a, bu_a, row_base, N, K, KG, gsh, k0, Ws, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        GEMM_MMA(u00, u01, u02, u03, u10, u11, u12, u13)
+        if (sm * 16 < M) { GEMM_MMA(u00, u01, u02, u03, u10, u11, u12, u13) }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     threadgroup float* gbuf = Cg_s + int(sg) * 64;
@@ -1167,6 +1172,7 @@ inline void swiglu_gemm_impl(
 }
 
 #define DECL_QMM_GEMM(NAME, BITS) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
     device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
     constant QMVMultiParams& p [[buffer(5)]], \
@@ -1178,6 +1184,7 @@ kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[
     qmm_gemm_impl<BITS>(x + ulong(mb) * ulong(p.K), w, s, b, out + ulong(mb) * ulong(p.N), q, Xs, Ws, Cs, tgp.x, tid, sg, lane); \
 }
 #define DECL_SWIG_GEMM(NAME, BITS) \
+[[max_total_threads_per_threadgroup(128)]] \
 kernel void NAME(device const half* x [[buffer(0)]], \
     device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
     device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
@@ -1354,8 +1361,8 @@ kernel void deltanet_recurrent_spec(
             bet_s[m] = 1.0f / (1.0f + exp(-float(b_buf[m * p.n_vh + hv])));
             hist_dec[m * p.n_vh + hv] = dec;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int col4 = int(lane) * 4;
     const device float4* S_head = (const device float4*)(S_state + ulong(hv) * ulong(p.v_hd * p.k_hd));

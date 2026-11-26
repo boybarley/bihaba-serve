@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <mach-o/dyld.h>
 #include <libgen.h>
 
@@ -432,6 +433,9 @@ struct Qwen35Engine {
             q.N    = [qm[2] intValue]; q.K  = [qm[3] intValue];
             q.gs_shift = (q.gs == 32) ? 5 : 6;
             check_qtensor(k.c_str(), q.bits, q.gs, q.K, q.N);
+            if (q.bits != 2 && q.bits != 3 && q.bits != 4 && q.bits != 8) {
+                fprintf(stderr, "Unsupported bits=%d for %s\n", q.bits, k.c_str()); exit(1);
+            }
             if (is_switch) {
                 uint64_t kw = (q.bits == 4) ? uint64_t(q.K >> 3) :
                               (q.bits == 2) ? uint64_t(q.K >> 4) :
@@ -1018,6 +1022,12 @@ struct Qwen35Engine {
             if (lin_vhd <= 0 || lin_vhd > 128) return bad("linear_value_head_dim harus 1..128");
             if (lin_kh <= 0 || lin_vh % lin_kh) return bad("linear_num_value_heads harus kelipatan linear_num_key_heads");
         }
+        if (is_moe) {
+            for (const auto& L : layers) {
+                if ((L.moe_gp.bits < 2 || L.moe_gp.bits > 4) || (L.moe_up.bits < 2 || L.moe_up.bits > 4) || (L.moe_dp.bits < 2 || L.moe_dp.bits > 4))
+                    return bad("MoE expert hanya mendukung 2/3/4-bit");
+            }
+        }
         if (is_moe && (num_experts > 256 || top_k < 1 || top_k > num_experts || top_k > 16))
             return bad("MoE butuh num_experts ≤ 256 dan 1 ≤ top_k ≤ min(16, num_experts)");
         return true;
@@ -1272,7 +1282,10 @@ struct Qwen35Engine {
                 [e setBuffer:b_qkv offset:0 atIndex:13]; [e setBuffer:b_z offset:0 atIndex:14];
                 [e setBuffer:b_a   offset:0 atIndex:15]; [e setBuffer:b_b offset:0 atIndex:16];
                 [e setBytes:&dp length:sizeof(dp) atIndex:17];
-                [e dispatchThreadgroups:MTLSizeMake((tot_n + rpt_dn - 1) / rpt_dn, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                int grid_dn = mma
+                    ? (((L.in_qkv.N + 31) >> 5) + ((L.in_z.N + 31) >> 5) + ((L.in_a.N + 31) >> 5) + ((L.in_b.N + 31) >> 5))
+                    : ((tot_n + rpt_dn - 1) / rpt_dn);
+                [e dispatchThreadgroups:MTLSizeMake(grid_dn, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             } else {
                 enc_qmv(e, M, b_xn, L.in_qkv, b_qkv, false);
                 enc_qmv(e, M, b_xn, L.in_z,   b_z,   false);
@@ -1341,7 +1354,10 @@ struct Qwen35Engine {
                 [e setBuffer:L.v.w_buf offset:L.v.w atIndex:7]; [e setBuffer:L.v.s_buf offset:L.v.s atIndex:8]; [e setBuffer:L.v.b_buf offset:L.v.b atIndex:9];
                 [e setBuffer:b_q_raw offset:0 atIndex:10]; [e setBuffer:b_k offset:0 atIndex:11]; [e setBuffer:b_v offset:0 atIndex:12];
                 [e setBytes:&qp length:sizeof(qp) atIndex:13];
-                [e dispatchThreadgroups:MTLSizeMake((tot_n + rpt_fq - 1) / rpt_fq, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                int grid_fq = mma
+                    ? (((L.q.N + 31) >> 5) + ((L.k.N + 31) >> 5) + ((L.v.N + 31) >> 5))
+                    : ((tot_n + rpt_fq - 1) / rpt_fq);
+                [e dispatchThreadgroups:MTLSizeMake(grid_fq, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             } else {
                 enc_qmv(e, M, b_xn, L.q, b_q_raw, false);
                 enc_qmv(e, M, b_xn, L.k, b_k,     false);
@@ -1461,7 +1477,8 @@ struct Qwen35Engine {
             exit(1);
         }
         memcpy([b_tok contents], ids, size_t(M) * sizeof(int32_t));
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        @autoreleasepool {
+        id<MTLCommandBuffer> cb = [queue commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
         if (pending_dn_commit > 0) {
@@ -1533,6 +1550,7 @@ struct Qwen35Engine {
             } else if (out_ids) {
                 memcpy(out_ids, [b_out_tok contents], size_t(HM) * sizeof(int32_t));
             }
+        }
         }
     }
 
@@ -1851,25 +1869,27 @@ static SpecStats generate_adaptive(
 
         st.accepted += acc;
         int n_emit = int(emitted.size());
+        int n_keep = n_emit;
+        for (int i = 0; i < n_emit; ++i) {
+            if ((!ignore_eos && eng.is_eos(emitted[i])) || int(st.tokens.size()) + i + 1 >= max_tokens) {
+                n_keep = i + 1;
+                break;
+            }
+        }
 
-        if (M > 1) eng.pending_dn_commit = n_emit;
+        if (M > 1) eng.pending_dn_commit = n_keep;
         if (ord > 0 && M > 1) oa.update(ord, acc, was_rejected);
 
-        // n_emit token batch[0..n_emit-1] SUDAH masuk state (KV + DeltaNet di-commit langkah berikutnya),
-        // jadi catat semuanya SEBELUM loop emisi yang bisa berhenti lebih awal (EOS / max_tokens).
-        // Versi lama mencatatnya di dalam loop → cached_ids tertinggal dari state → giliran chat berikutnya
-        // memakai ulang state yang salah tanpa error.
-        for (int i = 0; i < n_emit; ++i) eng.cached_ids.push_back(batch[i]);
+        for (int i = 0; i < n_keep; ++i) eng.cached_ids.push_back(batch[i]);
 
-        for (int i = 0; i < n_emit; ++i) {
+        for (int i = 0; i < n_keep; ++i) {
             int32_t tok = emitted[i];
             st.tokens.push_back(tok);
             sfx.push(tok);
             nxt = tok;
             if (stream_stdout) { printf("{\"tok\":%d}\n", tok); fflush(stdout); }
-            if ((!ignore_eos && eng.is_eos(tok)) || int(st.tokens.size()) >= max_tokens) break;
         }
-        pos += n_emit;
+        pos += n_keep;
     }
 
     st.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - td0).count();
@@ -1877,6 +1897,7 @@ static SpecStats generate_adaptive(
 }
 
 int main(int argc, char** argv) {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     @autoreleasepool {
         if (argc < 2) {
             printf("Usage (Direct Zero-Copy ~/models/<dir> OR .taalas2 binary):\n");
