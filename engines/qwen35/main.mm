@@ -891,8 +891,9 @@ struct Qwen35Engine {
         for (int bb : {2, 3, 4, 6, 8}) {
             for (int P = 0; P < 2; ++P) {
                 char qn[48], sn[48];
-                snprintf(qn, sizeof(qn), "qmm_%db_%s", bb, P ? "mmaP" : "mma8");
-                snprintf(sn, sizeof(sn), "dense_swiglu_%db_%s", bb, P ? "mmaP" : "mma8");
+                // P=1 (prefill, M>8): kernel GEMM 32×64; P=0 (verifikasi, M≤8): MMA 8 token
+                snprintf(qn, sizeof(qn), "qmm_%db_%s", bb, P ? "gemm" : "mma8");
+                snprintf(sn, sizeof(sn), "dense_swiglu_%db_%s", bb, P ? "gemm" : "mma8");
                 pso_mm[bb][P][0] = make_pso(dev, lib, qn, false, bf);
                 pso_mm[bb][P][1] = make_pso(dev, lib, qn, true,  bf);
                 pso_swm[bb][P]   = make_pso(dev, lib, sn, false, bf);
@@ -1206,7 +1207,7 @@ struct Qwen35Engine {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
         } else if (M >= mma_min_m(qt.bits) && mma_ok) {
             pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
-            rows_per_tg = 32;
+            rows_per_tg = (M > MAX_M) ? 64 : 32;
         } else {
             pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
         }
@@ -1231,7 +1232,7 @@ struct Qwen35Engine {
         id<MTLComputePipelineState> pso = use_mma
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
-        const int rows_per_tg = use_mma ? 32 : 4;
+        const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
         [e setComputePipelineState:pso];
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
         [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
@@ -1254,7 +1255,7 @@ struct Qwen35Engine {
         if (L.type == 0) {
             if (L.in_qkv.bits == 4 && L.in_z.bits == 4 && L.in_a.bits == 4 && L.in_b.bits == 4 &&
                 L.in_qkv.gs_shift == L.in_z.gs_shift && L.in_qkv.gs_shift == L.in_a.gs_shift &&
-                L.in_qkv.gs_shift == L.in_b.gs_shift && (M <= MAX_M || dim % 64 == 0)) {
+                L.in_qkv.gs_shift == L.in_b.gs_shift && M <= MAX_M) {
                 DeltaNetInParams dp{M, dim, L.in_qkv.gs_shift, L.in_qkv.N, L.in_z.N, L.in_a.N, L.in_b.N};
                 int tot_n = L.in_qkv.N + L.in_z.N + L.in_a.N + L.in_b.N;
                 const bool mma = (M >= 4 && (dim % 64 == 0));
@@ -1325,7 +1326,7 @@ struct Qwen35Engine {
             bar(e);
         } else {
             if (L.q.bits == 4 && L.k.bits == 4 && L.v.bits == 4 && L.q.gs_shift == L.k.gs_shift &&
-                L.q.gs_shift == L.v.gs_shift && (M <= MAX_M || dim % 64 == 0)) {
+                L.q.gs_shift == L.v.gs_shift && M <= MAX_M) {
                 FullQKVParams qp{M, dim, L.q.gs_shift, L.q.N, L.k.N, L.v.N};
                 int tot_n = L.q.N + L.k.N + L.v.N;
                 const bool mma = (M >= 4 && (dim % 64 == 0));
@@ -1951,6 +1952,21 @@ int main(int argc, char** argv) {
                     eng.prefill_chunk = saved;
                     printf("▸ Prefill Bench (512 tok, chunk %2d):      %.1f ms => %.0f tok/s\n", ch, best, 512 * 1000.0 / best);
                     if (ch == eng.prefill_chunk) break;
+                }
+                // Kebenaran prefill: 32 token greedy setelah prompt yang sama, chunk 8 (jalur MMA-8 v1.0) vs chunk aktif.
+                if (eng.prefill_chunk != 8) {
+                    std::vector<int32_t> ref, got;
+                    for (int ch : {8, eng.prefill_chunk}) {
+                        const int saved = eng.prefill_chunk; eng.prefill_chunk = ch;
+                        eng.reset_states(); eng.ram_snap = StateSnapshot{};
+                        SpecStats gg = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true);
+                        eng.prefill_chunk = saved;
+                        (ch == 8 ? ref : got) = gg.tokens;
+                    }
+                    int same = 0;
+                    while (same < int(std::min(ref.size(), got.size())) && ref[size_t(same)] == got[size_t(same)]) same++;
+                    printf("▸ Prefill check (chunk %d vs 8):          %d/%zu token greedy identik%s\n", eng.prefill_chunk, same, ref.size(),
+                           same == int(ref.size()) ? "" : "  (selisih awal kecil bisa karena urutan penjumlahan fp16; selisih di token 0–1 = bug)");
                 }
             }
 

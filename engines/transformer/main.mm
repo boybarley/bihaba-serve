@@ -616,8 +616,9 @@ struct TransformerEngine {
         for (int bb : {2, 3, 4, 6, 8}) {
             for (int P = 0; P < 2; ++P) {
                 char qn[48], sn[48];
-                snprintf(qn, sizeof(qn), "qmm_%db_%s", bb, P ? "mmaP" : "mma8");
-                snprintf(sn, sizeof(sn), "dense_swiglu_%db_%s", bb, P ? "mmaP" : "mma8");
+                // P=1 (prefill, M>8): kernel GEMM 32×64; P=0 (verifikasi, M≤8): MMA 8 token
+                snprintf(qn, sizeof(qn), "qmm_%db_%s", bb, P ? "gemm" : "mma8");
+                snprintf(sn, sizeof(sn), "dense_swiglu_%db_%s", bb, P ? "gemm" : "mma8");
                 pso_mm[bb][P][0] = make_pso(dev, lib, qn, false, bf);
                 pso_mm[bb][P][1] = make_pso(dev, lib, qn, true,  bf);
                 pso_swm[bb][P]   = make_pso(dev, lib, sn, false, bf);
@@ -776,7 +777,7 @@ struct TransformerEngine {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
         } else if (M >= mma_min_m(qt.bits) && mma_ok) {
             pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
-            rows_per_tg = 32;
+            rows_per_tg = (M > MAX_M) ? 64 : 32;
         } else {
             pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
         }
@@ -801,7 +802,7 @@ struct TransformerEngine {
         id<MTLComputePipelineState> pso = use_mma
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
-        const int rows_per_tg = use_mma ? 32 : 4;
+        const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
         [e setComputePipelineState:pso];
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
         [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
@@ -1208,6 +1209,21 @@ int main(int argc, char** argv) {
                     eng.prefill_chunk = saved;
                     printf("▸ Prefill Bench (512 tok, chunk %2d):   %.1f ms => %.0f tok/s\n", ch, best, 512 * 1000.0 / best);
                     if (ch == eng.prefill_chunk) break;
+                }
+                // Kebenaran prefill: 32 token greedy setelah prompt yang sama, chunk 8 (jalur MMA-8 v1.0) vs chunk aktif.
+                if (eng.prefill_chunk != 8) {
+                    std::vector<int32_t> ref, got;
+                    for (int ch : {8, eng.prefill_chunk}) {
+                        const int saved = eng.prefill_chunk; eng.prefill_chunk = ch;
+                        eng.reset_states();
+                        SpecStats gg = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true);
+                        eng.prefill_chunk = saved;
+                        (ch == 8 ? ref : got) = gg.tokens;
+                    }
+                    int same = 0;
+                    while (same < int(std::min(ref.size(), got.size())) && ref[size_t(same)] == got[size_t(same)]) same++;
+                    printf("▸ Prefill check (chunk %d vs 8):          %d/%zu token greedy identik%s\n", eng.prefill_chunk, same, ref.size(),
+                           same == int(ref.size()) ? "" : "  (selisih awal kecil bisa karena urutan penjumlahan fp16; selisih di token 0–1 = bug)");
                 }
             }
             // CATATAN: pola sintetis (deret angka berulang) → angka spekulatif = batas atas.

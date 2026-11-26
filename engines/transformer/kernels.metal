@@ -807,6 +807,170 @@ DECL_SWIG_MMA(dense_swiglu_6b_mmaP, 6, 4)
 DECL_SWIG_MMA(dense_swiglu_8b_mma8, 8, 1)
 DECL_SWIG_MMA(dense_swiglu_8b_mmaP, 8, 4)
 
+// ─────────────────────── 4G. Prefill GEMM (M=9..32): tile 32 token × 64 baris bobot ───────────────────────
+// 4 simdgroup, masing-masing 16 token × 32 baris = 8 akumulator. Per langkah kk: 2 load A + 4 load B untuk
+// 8 MMA (0.75 load/MMA) vs kernel mmaP 1.25 load/MMA. Dekuantisasi 64 baris dibagi untuk 32 token.
+#define GEMM_LD 72
+
+template <int BITS>
+inline void dequant_row16(device const uint32_t* w, device const ushort* scales, device const ushort* biases,
+                          int r, int K, int KG, int gsh, int kidx, threadgroup half* dst) {
+    const ulong s_off = ulong(r) * ulong(KG) + ulong(kidx >> gsh);
+    const half2 hs = half2(load_sb_h(scales, s_off));
+    const half2 hb = half2(load_sb_h(biases, s_off));
+    if (BITS == 4) {
+        const ulong wi = ulong(r) * ulong(K >> 3) + ulong(kidx >> 3);
+        dequant_4bit_to_tg(w[wi],     hs, hb, dst);
+        dequant_4bit_to_tg(w[wi + 1], hs, hb, dst + 8);
+    } else if (BITS == 2) {
+        dequant_2bit_to_tg(w[ulong(r) * ulong(K >> 4) + ulong(kidx >> 4)], hs, hb, dst);
+    } else {
+        dequant_gen16_to_tg<BITS>(w + ulong(r) * ulong((K * BITS) >> 5), kidx, float(hs.x), float(hb.x), dst);
+    }
+}
+
+inline void gemm_load_x(device const half* x, int M, int K, int k0, threadgroup half* Xs, uint tid) {
+    const int m = int(tid) >> 2, kq = (int(tid) & 3) * 16;
+    threadgroup half4* d = (threadgroup half4*)(Xs + m * GEMM_LD + kq);
+    if (m < M) {
+        const device half4* s = (const device half4*)(x + m * K + k0 + kq);
+        d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+    } else {
+        d[0] = half4(0.0h); d[1] = half4(0.0h); d[2] = half4(0.0h); d[3] = half4(0.0h);
+    }
+}
+
+template <int BITS>
+inline void gemm_load_w(device const uint32_t* w, device const ushort* scales, device const ushort* biases,
+                        int row_base, int N, int K, int KG, int gsh, int k0, threadgroup half* Ws, uint tid) {
+    const int r_off = int(tid) >> 1, r = min(row_base + r_off, N - 1);
+    const int kq = (int(tid) & 1) * 32;
+    dequant_row16<BITS>(w, scales, biases, r, K, KG, gsh, k0 + kq,      Ws + r_off * GEMM_LD + kq);
+    dequant_row16<BITS>(w, scales, biases, r, K, KG, gsh, k0 + kq + 16, Ws + r_off * GEMM_LD + kq + 16);
+}
+
+#define GEMM_MMA(C00, C01, C02, C03, C10, C11, C12, C13) \
+    _Pragma("unroll") \
+    for (int kk = 0; kk < 64; kk += 8) { \
+        simdgroup_half8x8 a0, a1, b0, b1, b2, b3; \
+        simdgroup_load(a0, xs_sg + kk, GEMM_LD); \
+        simdgroup_load(a1, xs_sg + 8 * GEMM_LD + kk, GEMM_LD); \
+        simdgroup_load(b0, ws_sg + kk, GEMM_LD, ulong2(0, 0), true); \
+        simdgroup_load(b1, ws_sg + 8 * GEMM_LD + kk, GEMM_LD, ulong2(0, 0), true); \
+        simdgroup_load(b2, ws_sg + 16 * GEMM_LD + kk, GEMM_LD, ulong2(0, 0), true); \
+        simdgroup_load(b3, ws_sg + 24 * GEMM_LD + kk, GEMM_LD, ulong2(0, 0), true); \
+        simdgroup_multiply_accumulate(C00, a0, b0, C00); simdgroup_multiply_accumulate(C01, a0, b1, C01); \
+        simdgroup_multiply_accumulate(C02, a0, b2, C02); simdgroup_multiply_accumulate(C03, a0, b3, C03); \
+        simdgroup_multiply_accumulate(C10, a1, b0, C10); simdgroup_multiply_accumulate(C11, a1, b1, C11); \
+        simdgroup_multiply_accumulate(C12, a1, b2, C12); simdgroup_multiply_accumulate(C13, a1, b3, C13); \
+    }
+
+template <int BITS>
+inline void qmm_gemm_impl(
+    device const half* x, device const uint32_t* w, device const ushort* scales, device const ushort* biases,
+    device half* out, QMVMultiParams p, threadgroup half* Xs, threadgroup half* Ws, threadgroup float* Cs,
+    uint tg_x, uint tid, uint sg, uint lane)
+{
+    const int M = p.M, K = p.K, N = p.N, gsh = p.gs_shift, KG = K >> gsh;
+    const int row_base = int(tg_x) * 64;
+    const int sm = int(sg) >> 1, sn = int(sg) & 1;
+    const threadgroup half* xs_sg = Xs + (sm * 16) * GEMM_LD;
+    const threadgroup half* ws_sg = Ws + (sn * 32) * GEMM_LD;
+
+    simdgroup_float8x8 c00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 c01 = c00, c02 = c00, c03 = c00, c10 = c00, c11 = c00, c12 = c00, c13 = c00;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        gemm_load_x(x, M, K, k0, Xs, tid);
+        gemm_load_w<BITS>(w, scales, biases, row_base, N, K, KG, gsh, k0, Ws, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        GEMM_MMA(c00, c01, c02, c03, c10, c11, c12, c13)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float* cbuf = Cs + int(sg) * 64;
+    const int m0 = sm * 16, n0 = row_base + sn * 32;
+    qmm_store_tile(c00, m0,     cbuf, out, M, N, n0,      lane);
+    qmm_store_tile(c01, m0,     cbuf, out, M, N, n0 + 8,  lane);
+    qmm_store_tile(c02, m0,     cbuf, out, M, N, n0 + 16, lane);
+    qmm_store_tile(c03, m0,     cbuf, out, M, N, n0 + 24, lane);
+    qmm_store_tile(c10, m0 + 8, cbuf, out, M, N, n0,      lane);
+    qmm_store_tile(c11, m0 + 8, cbuf, out, M, N, n0 + 8,  lane);
+    qmm_store_tile(c12, m0 + 8, cbuf, out, M, N, n0 + 16, lane);
+    qmm_store_tile(c13, m0 + 8, cbuf, out, M, N, n0 + 24, lane);
+}
+
+template <int BITS>
+inline void swiglu_gemm_impl(
+    device const half* x,
+    device const uint32_t* wg, device const ushort* sg_a, device const ushort* bg_a,
+    device const uint32_t* wu, device const ushort* su_a, device const ushort* bu_a,
+    device half* out, QMVMultiParams p, threadgroup half* Xs, threadgroup half* Ws,
+    threadgroup float* Cg_s, threadgroup float* Cu_s, uint tg_x, uint tid, uint sg, uint lane)
+{
+    const int M = p.M, K = p.K, N = p.N, gsh = p.gs_shift, KG = K >> gsh;
+    const int row_base = int(tg_x) * 64;
+    const int sm = int(sg) >> 1, sn = int(sg) & 1;
+    const threadgroup half* xs_sg = Xs + (sm * 16) * GEMM_LD;
+    const threadgroup half* ws_sg = Ws + (sn * 32) * GEMM_LD;
+
+    simdgroup_float8x8 g00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 g01 = g00, g02 = g00, g03 = g00, g10 = g00, g11 = g00, g12 = g00, g13 = g00;
+    simdgroup_float8x8 u00 = g00, u01 = g00, u02 = g00, u03 = g00, u10 = g00, u11 = g00, u12 = g00, u13 = g00;
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        gemm_load_x(x, M, K, k0, Xs, tid);
+        gemm_load_w<BITS>(wg, sg_a, bg_a, row_base, N, K, KG, gsh, k0, Ws, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        GEMM_MMA(g00, g01, g02, g03, g10, g11, g12, g13)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemm_load_w<BITS>(wu, su_a, bu_a, row_base, N, K, KG, gsh, k0, Ws, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        GEMM_MMA(u00, u01, u02, u03, u10, u11, u12, u13)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float* gbuf = Cg_s + int(sg) * 64;
+    threadgroup float* ubuf = Cu_s + int(sg) * 64;
+    const int m0 = sm * 16, n0 = row_base + sn * 32;
+    swiglu_store_tile(g00, u00, m0,     gbuf, ubuf, out, M, N, n0,      lane);
+    swiglu_store_tile(g01, u01, m0,     gbuf, ubuf, out, M, N, n0 + 8,  lane);
+    swiglu_store_tile(g02, u02, m0,     gbuf, ubuf, out, M, N, n0 + 16, lane);
+    swiglu_store_tile(g03, u03, m0,     gbuf, ubuf, out, M, N, n0 + 24, lane);
+    swiglu_store_tile(g10, u10, m0 + 8, gbuf, ubuf, out, M, N, n0,      lane);
+    swiglu_store_tile(g11, u11, m0 + 8, gbuf, ubuf, out, M, N, n0 + 8,  lane);
+    swiglu_store_tile(g12, u12, m0 + 8, gbuf, ubuf, out, M, N, n0 + 16, lane);
+    swiglu_store_tile(g13, u13, m0 + 8, gbuf, ubuf, out, M, N, n0 + 24, lane);
+}
+
+#define DECL_QMM_GEMM(NAME, BITS) \
+kernel void NAME(device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]], \
+    device const ushort* s [[buffer(2)]], device const ushort* b [[buffer(3)]], device half* out [[buffer(4)]], \
+    constant QMVMultiParams& p [[buffer(5)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    threadgroup half Xs[32 * GEMM_LD], Ws[64 * GEMM_LD]; threadgroup float Cs[4 * 64]; \
+    qmm_gemm_impl<BITS>(x, w, s, b, out, p, Xs, Ws, Cs, tg_x, tid, sg, lane); \
+}
+#define DECL_SWIG_GEMM(NAME, BITS) \
+kernel void NAME(device const half* x [[buffer(0)]], \
+    device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
+    device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
+    device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    threadgroup half Xs[32 * GEMM_LD], Ws[64 * GEMM_LD]; threadgroup float Cg_s[4 * 64], Cu_s[4 * 64]; \
+    swiglu_gemm_impl<BITS>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, Xs, Ws, Cg_s, Cu_s, tg_x, tid, sg, lane); \
+}
+DECL_QMM_GEMM(qmm_2b_gemm, 2)
+DECL_SWIG_GEMM(dense_swiglu_2b_gemm, 2)
+DECL_QMM_GEMM(qmm_3b_gemm, 3)
+DECL_SWIG_GEMM(dense_swiglu_3b_gemm, 3)
+DECL_QMM_GEMM(qmm_4b_gemm, 4)
+DECL_SWIG_GEMM(dense_swiglu_4b_gemm, 4)
+DECL_QMM_GEMM(qmm_6b_gemm, 6)
+DECL_SWIG_GEMM(dense_swiglu_6b_gemm, 6)
+DECL_QMM_GEMM(qmm_8b_gemm, 8)
+DECL_SWIG_GEMM(dense_swiglu_8b_gemm, 8)
+
 // ─────────────────────── 5. Unified QK-Norm + Optional QKV Bias + Split-Half RoPE (hd=64/128/256) ───────────────────────
 kernel void tr_qknorm_rope_kv(
     device half*       q_buf   [[buffer(0)]],
