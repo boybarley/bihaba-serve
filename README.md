@@ -35,7 +35,22 @@ All benchmarks measured directly from `.safetensors` directories (**0 GB disk du
 | **Bihaba-AI-1.7B-Final** | 28L Qwen3 1.7B Dense (6b) | 1.40 GB | **367 ms** | **131.5 tok/s** | **222.4 tok/s** | — |
 | **MNN-Pocket-0.3B-MLX-4bit** | 28L Qwen3 0.3B Dense (4b) | 0.17 GB | **337 ms** | **337.6 tok/s** | **1,205.4 tok/s** | — |
 
-> **How to read the `Speculative k=7` column:** these numbers come from `bench`, whose prompt is a *synthetic repeating pattern* (the best case for n-gram drafting). On real chat/code the speedup depends on how repetitive the output is: typically 1.2–2× for code/JSON/RAG and ≈1× for free-form prose. The speculation is lossless (the output is identical to greedy), so it never makes quality worse. These v1.0 numbers have not yet been re-measured with v1.1; run the commands in *Testing v1.1 on your Mac* below.
+> **How to read the `Speculative k=7` column:** these numbers come from `bench`, whose prompt is a *synthetic repeating pattern* (the best case for n-gram drafting). On real chat/code the speedup depends on how repetitive the output is: typically 1.2–2× for code/JSON/RAG and ≈1× for free-form prose. The speculation is lossless (the output is identical to greedy), so it never makes quality worse.
+
+### v1.0 → v1.2 on the same machine (M1 Max 64 GB, same models, same session)
+
+| Model | Metric | v1.0 | v1.2 | Gain |
+|---|---|---|---|---|
+| **Bihaba-AI-1.7B** (6-bit) | Prefill 512 tok | 275 tok/s | **765 tok/s** | 2.8× |
+| | Speculative k=7 (synthetic) | 232.7 tok/s | **457.5 tok/s** | 1.97× |
+| | Verify step M=8 | 32.0 ms | **16.8 ms** | 1.9× |
+| **Qwythos-9B** (4-bit, DeltaNet) | Prefill 512 tok | 104 tok/s | **241 tok/s** | 2.3× |
+| | Speculative k=7 (synthetic) | 141.3 tok/s | 141.3 tok/s | = |
+| **35B-A3B MoE** (`--top-k 4`) | Prefill 512 tok | 217 tok/s | **343 tok/s** | 1.58× |
+| | Speculative k=7 (synthetic) | 246.6 tok/s | 246.8 tok/s | = |
+| All | Greedy decode M=1 | | unchanged | = |
+
+Every run reports `=greedy 128/128` (speculative output identical to greedy) and `Prefill check 32/32` (the GEMM prefill produces exactly the same greedy continuation as the v1.0 8-token path).
 
 ---
 
@@ -119,10 +134,10 @@ bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --profile --tok
 
 ---
 
-## What's new in v1.1
+## What's new in v1.1 / v1.2
 
 **Faster**
-- **Prefill uses 32-token MMA tiles** (`*_mmaP` kernels). Each weight tile read from memory is reused for 32 tokens instead of 8, so the main cost of a long prompt is cut by roughly 4×. DeltaNet prefill now runs a dedicated kernel that keeps the state in registers for the whole chunk. The LM head is computed only for the last prompt token. Control it with `--prefill-chunk N` (1..32; 8 = v1.0 behaviour).
+- **Prefill uses a dedicated GEMM kernel** (`*_gemm`, 32 tokens × 64 weight rows per threadgroup, 8 accumulators per simdgroup). It covers every bit-width (2/3/4/6/8). Each weight tile is dequantized once and reused for 32 tokens. Verification steps (M ≤ 8) now also use MMA for 3/6/8-bit models. DeltaNet prefill now runs a dedicated kernel that keeps the state in registers for the whole chunk. The LM head is computed only for the last prompt token. Control it with `--prefill-chunk N` (1..32; 8 = v1.0 behaviour).
 - **Speculative decoding:** a per-n-gram-order acceptance estimator, α = accepted / (accepted + rejections), replaces the old EMA, which penalized k too hard after a single rejection.
 
 **Correct**
