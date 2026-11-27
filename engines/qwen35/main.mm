@@ -1404,16 +1404,9 @@ struct Qwen35Engine {
 
     // prefill=true: DeltaNet memakai kernel prefill (state langsung diperbarui, M bebas, tanpa commit tertunda).
     // prefill=false & M>1: verifikasi spekulatif (state hanya dibaca, riwayat untuk commit token yang diterima).
-    void enc_layer_attn(id<MTLComputeCommandEncoder> e, int M, int l, int pos, bool prefill = false) {
+    // Proyeksi masuk DeltaNet / full-attention (dipisah agar bisa diukur microbench; isi tidak berubah)
+    void enc_dn_inproj(id<MTLComputeCommandEncoder> e, int M, int l) {
         const auto& L = layers[l];
-        NormParams np{dim, rms_eps};
-        set_pso(e, pso_rms);
-        [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.in_norm.buf offset:L.in_norm.off atIndex:1];
-        [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
-        [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        bar(e);
-
-        if (L.type == 0) {
             if (L.in_qkv.bits == 4 && L.in_z.bits == 4 && L.in_a.bits == 4 && L.in_b.bits == 4 &&
                 L.in_qkv.gs_shift == L.in_z.gs_shift && L.in_qkv.gs_shift == L.in_a.gs_shift &&
                 L.in_qkv.gs_shift == L.in_b.gs_shift && M <= MAX_M) {
@@ -1441,6 +1434,46 @@ struct Qwen35Engine {
                 enc_qmv(e, M, b_xn, L.in_a,   b_a,   false);
                 enc_qmv(e, M, b_xn, L.in_b,   b_b,   false);
             }
+    }
+
+    void enc_full_qkv(id<MTLComputeCommandEncoder> e, int M, int l) {
+        const auto& L = layers[l];
+            if (L.q.bits == 4 && L.k.bits == 4 && L.v.bits == 4 && L.q.gs_shift == L.k.gs_shift &&
+                L.q.gs_shift == L.v.gs_shift && M <= MAX_M) {
+                FullQKVParams qp{M, dim, L.q.gs_shift, L.q.N, L.k.N, L.v.N};
+                int tot_n = L.q.N + L.k.N + L.v.N;
+                const bool mma = (M >= 4 && (dim % 64 == 0));
+                id<MTLComputePipelineState> pso_fq = (M == 1) ? pso_full_qkv4_m1 : (mma ? (M > MAX_M ? pso_full_qkv4_mmaP : pso_full_qkv4_mma8) : pso_full_qkv4);
+                int rpt_fq = (M == 1) ? 8 : (mma ? 32 : 4);
+                set_pso(e, pso_fq);
+                [e setBuffer:b_xn offset:0 atIndex:0];
+                [e setBuffer:L.q.w_buf offset:L.q.w atIndex:1]; [e setBuffer:L.q.s_buf offset:L.q.s atIndex:2]; [e setBuffer:L.q.b_buf offset:L.q.b atIndex:3];
+                [e setBuffer:L.k.w_buf offset:L.k.w atIndex:4]; [e setBuffer:L.k.s_buf offset:L.k.s atIndex:5]; [e setBuffer:L.k.b_buf offset:L.k.b atIndex:6];
+                [e setBuffer:L.v.w_buf offset:L.v.w atIndex:7]; [e setBuffer:L.v.s_buf offset:L.v.s atIndex:8]; [e setBuffer:L.v.b_buf offset:L.v.b atIndex:9];
+                [e setBuffer:b_q_raw offset:0 atIndex:10]; [e setBuffer:b_k offset:0 atIndex:11]; [e setBuffer:b_v offset:0 atIndex:12];
+                [e setBytes:&qp length:sizeof(qp) atIndex:13];
+                int grid_fq = mma
+                    ? (((L.q.N + 31) >> 5) + ((L.k.N + 31) >> 5) + ((L.v.N + 31) >> 5))
+                    : ((tot_n + rpt_fq - 1) / rpt_fq);
+                [e dispatchThreadgroups:MTLSizeMake(grid_fq, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                enc_qmv(e, M, b_xn, L.q, b_q_raw, false);
+                enc_qmv(e, M, b_xn, L.k, b_k,     false);
+                enc_qmv(e, M, b_xn, L.v, b_v,     false);
+            }
+    }
+
+    void enc_layer_attn(id<MTLComputeCommandEncoder> e, int M, int l, int pos, bool prefill = false) {
+        const auto& L = layers[l];
+        NormParams np{dim, rms_eps};
+        set_pso(e, pso_rms);
+        [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.in_norm.buf offset:L.in_norm.off atIndex:1];
+        [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        bar(e);
+
+        if (L.type == 0) {
+            enc_dn_inproj(e, M, l);
             bar(e);
 
             Conv1dParams cp{M, qkv_lin_dim, conv_k};
@@ -1489,29 +1522,7 @@ struct Qwen35Engine {
             enc_qmv(e, M, b_dn_out, L.out_p, b_x, true);
             bar(e);
         } else {
-            if (L.q.bits == 4 && L.k.bits == 4 && L.v.bits == 4 && L.q.gs_shift == L.k.gs_shift &&
-                L.q.gs_shift == L.v.gs_shift && M <= MAX_M) {
-                FullQKVParams qp{M, dim, L.q.gs_shift, L.q.N, L.k.N, L.v.N};
-                int tot_n = L.q.N + L.k.N + L.v.N;
-                const bool mma = (M >= 4 && (dim % 64 == 0));
-                id<MTLComputePipelineState> pso_fq = (M == 1) ? pso_full_qkv4_m1 : (mma ? (M > MAX_M ? pso_full_qkv4_mmaP : pso_full_qkv4_mma8) : pso_full_qkv4);
-                int rpt_fq = (M == 1) ? 8 : (mma ? 32 : 4);
-                set_pso(e, pso_fq);
-                [e setBuffer:b_xn offset:0 atIndex:0];
-                [e setBuffer:L.q.w_buf offset:L.q.w atIndex:1]; [e setBuffer:L.q.s_buf offset:L.q.s atIndex:2]; [e setBuffer:L.q.b_buf offset:L.q.b atIndex:3];
-                [e setBuffer:L.k.w_buf offset:L.k.w atIndex:4]; [e setBuffer:L.k.s_buf offset:L.k.s atIndex:5]; [e setBuffer:L.k.b_buf offset:L.k.b atIndex:6];
-                [e setBuffer:L.v.w_buf offset:L.v.w atIndex:7]; [e setBuffer:L.v.s_buf offset:L.v.s atIndex:8]; [e setBuffer:L.v.b_buf offset:L.v.b atIndex:9];
-                [e setBuffer:b_q_raw offset:0 atIndex:10]; [e setBuffer:b_k offset:0 atIndex:11]; [e setBuffer:b_v offset:0 atIndex:12];
-                [e setBytes:&qp length:sizeof(qp) atIndex:13];
-                int grid_fq = mma
-                    ? (((L.q.N + 31) >> 5) + ((L.k.N + 31) >> 5) + ((L.v.N + 31) >> 5))
-                    : ((tot_n + rpt_fq - 1) / rpt_fq);
-                [e dispatchThreadgroups:MTLSizeMake(grid_fq, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-            } else {
-                enc_qmv(e, M, b_xn, L.q, b_q_raw, false);
-                enc_qmv(e, M, b_xn, L.k, b_k,     false);
-                enc_qmv(e, M, b_xn, L.v, b_v,     false);
-            }
+            enc_full_qkv(e, M, l);
             bar(e);
 
             QKNormRopeParams qp{M, n_heads, n_kv_heads, head_dim, rope_dim, pos, max_seq, rms_eps};
@@ -1820,6 +1831,23 @@ struct Qwen35Engine {
             rep("ffn gate+up (m1)", L.gate, &L.up, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, L.gate, L.up, b_dense_h); }));
             use_sw1 = sw_saved;
             rep("ffn down", L.down, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, L.down, b_x, false); }));
+        }
+        if (la >= 0) {
+            const auto& L = layers[size_t(la)];
+            const double us = timeit([&](id<MTLComputeCommandEncoder> e) { enc_dn_inproj(e, 1, la); });
+            QTensor all = L.in_qkv; all.N = L.in_qkv.N + L.in_z.N + L.in_a.N + L.in_b.N;
+            rep("deltanet in_proj(4)", all, nullptr, us);
+        }
+        {
+            int lf = -1;
+            for (int l = 0; l < n_layers; ++l) if (layers[size_t(l)].type == 1) { lf = l; break; }
+            if (lf >= 0) {
+                const auto& L = layers[size_t(lf)];
+                const double us = timeit([&](id<MTLComputeCommandEncoder> e) { enc_full_qkv(e, 1, lf); });
+                QTensor all = L.q; all.N = L.q.N + L.k.N + L.v.N;
+                rep("attn q+k+v", all, nullptr, us);
+                rep("attn o_proj", L.o, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_att, L.o, b_x, false); }));
+            }
         }
         if (la >= 0) {
             const auto& L = layers[size_t(la)];

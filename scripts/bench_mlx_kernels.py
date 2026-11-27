@@ -52,17 +52,29 @@ def main() -> int:
         ("ffn gate", r"layers\.\d+\.mlp\.gate_proj\.weight$"),
         ("ffn up", r"layers\.\d+\.mlp\.up_proj\.weight$"),
         ("ffn down", r"layers\.\d+\.mlp\.down_proj\.weight$"),
+        ("dn in_proj_qkv", r"layers\.\d+\.linear_attn\.in_proj_qkv\.weight$"),
+        ("dn in_proj_z", r"layers\.\d+\.linear_attn\.in_proj_z\.weight$"),
+        ("dn in_proj_a", r"layers\.\d+\.linear_attn\.in_proj_a\.weight$"),
+        ("dn in_proj_b", r"layers\.\d+\.linear_attn\.in_proj_b\.weight$"),
+        ("attn q_proj", r"layers\.\d+\.self_attn\.q_proj\.weight$"),
+        ("attn k_proj", r"layers\.\d+\.self_attn\.k_proj\.weight$"),
+        ("attn v_proj", r"layers\.\d+\.self_attn\.v_proj\.weight$"),
+        ("attn o_proj", r"layers\.\d+\.self_attn\.o_proj\.weight$"),
         ("deltanet out_proj", r"layers\.\d+\.linear_attn\.out_proj\.weight$"),
         ("lm_head", r"(^|\.)lm_head\.weight$"),
     ]
     print(f"▸ Kernel microbench MLX {mx.__version__} (M=1, R={R}, serial, quantized_matmul):")
     total_ffn = 0.0
+    sums: dict = {}
     for nm, pat in targets:
         key = find(index, pat)
         if key is None:
             print(f"   {nm:20s} (tidak ada)")
             continue
         base = key[: -len(".weight")]
+        if base + ".scales" not in index:
+            print(f"   {nm:20s} (tidak terkuantisasi, dilewati)")
+            continue
         w, s, b = tensor(key), tensor(base + ".scales"), tensor(base + ".biases")
         gs, bits = qparams(key)
         N, K = w.shape[0], w.shape[1] * 32 // bits
@@ -90,9 +102,17 @@ def main() -> int:
         nbytes = N * K * bits / 8 + 2 * N * (K // gs) * s.itemsize
         if nm in ("ffn gate", "ffn up"):
             total_ffn += us
+        if nm.startswith("dn in_proj"):
+            sums["dn"] = sums.get("dn", 0.0) + us
+        if nm in ("attn q_proj", "attn k_proj", "attn v_proj"):
+            sums["qkv"] = sums.get("qkv", 0.0) + us
         print(f"   {nm:20s} N={N:<6d} K={K:<6d} {bits}b : {us:8.1f} us  {nbytes / (us * 1e3):5.0f} GB/s")
     if total_ffn:
         print(f"   {'ffn gate+up (jumlah)':20s} {'':22s}: {total_ffn:8.1f} us")
+    if "dn" in sums:
+        print(f"   {'dn in_proj (jumlah 4)':20s} {'':22s}: {sums['dn']:8.1f} us")
+    if "qkv" in sums:
+        print(f"   {'attn q+k+v (jumlah)':20s} {'':22s}: {sums['qkv']:8.1f} us")
     return 0
 
 

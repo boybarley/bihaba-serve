@@ -371,3 +371,13 @@ Celah terbesar: SwiGLU M=1 (−33%). Dugaan: kernel generik `dense_swiglu_m_impl
 yang diindeks `m` runtime (pelajaran lama: array akumulator → spill). 1.7.0.dev6 menambah `dense_swiglu_{b}b_m1`
 (akumulator skalar; loop, ekspresi, dan simd_sum sama → diharapkan bit-identik) untuk M=1 di kedua engine.
 `BIHABA_SW1=0` → kernel lama. Microbench menampilkan lama vs m1.
+
+### 12.3 Hasil 1.7.0.dev6 (SwiGLU M=1 skalar) — LULUS, bit-identik
+
+gate+up 9B: 277.4 → 199.9 µs (283 GB/s, kini lebih cepat dari MLX 208.6 µs). Decode `uji_semua`:
+0.3B 341→354, 1.7B 133→141, Qwythos 46→52, MoE 98 (tetap). Jawaban keempat kelas identik.
+Sisa celah Qwythos vs MLX (52 vs 55.4): lm_head (1987 vs 1745 µs), down (109 vs 105.5 µs), dan proyeksi lain.
+
+### 12.4 1.7.0.dev7: microbench diperluas
+`enc_dn_inproj` / `enc_full_qkv` dipisah dari `enc_layer_attn` (isi tidak berubah) agar bisa diukur:
+deltanet in_proj (qkv+z+a+b fused), attn q+k+v (fused), attn o_proj. Skrip MLX mengukur tensor yang sama.
