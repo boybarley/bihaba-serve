@@ -39,9 +39,10 @@ def _msg_key(messages: list[dict]) -> list[tuple[str, str]]:
 #       tiap giliran (Qwythos riwayat 6k: ±20 s vs 0.3 s). Perilaku v1.5.0 yang sudah dipakai & dinilai baik.
 #   transformer (Qwen3/Llama dense, model kecil): MATI — terbukti mengubah jawaban Bihaba-AI-1.7B (CATATAN_TEKNIS §8).
 # Paksa per server dengan --session-cache / --no-session-cache.
-# 1.7.0.dev3: qwen35 kembali kanonik (jawaban = acuan); kecepatan giliran lanjut dari checkpoint per pesan
-# di engine. --session-cache tetap memaksa sesi token-persis (cepat, tidak kanonik).
-SESSION_CACHE_BY_ENGINE = {"qwen35": False, "transformer": False}
+# qwen35: sesi token-persis (TTFT ~0.3 s). Diuji 1.7.0.dev3: kanonik + checkpoint tetap harus mem-prefill ulang
+# jawaban lama (±1000 token → ±4.6 s di 9B), jadi checkpoint hanya cadangan jalur kanonik (sesi meleset,
+# riwayat diedit, klien API, uji acuan). --no-session-cache memaksa jalur kanonik.
+SESSION_CACHE_BY_ENGINE = {"qwen35": True, "transformer": False}
 
 
 class StreamDecoder:

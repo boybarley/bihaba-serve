@@ -465,7 +465,7 @@ class TestStreaming(unittest.TestCase):
 
     def test_session_policy_per_engine(self):
         from bihaba_serve.daemon import SESSION_CACHE_BY_ENGINE
-        self.assertFalse(SESSION_CACHE_BY_ENGINE["qwen35"])       # 1.7: kanonik + checkpoint per pesan
+        self.assertTrue(SESSION_CACHE_BY_ENGINE["qwen35"])        # sesi token-persis (checkpoint = cadangan kanonik)
         self.assertFalse(SESSION_CACHE_BY_ENGINE["transformer"])  # model kecil: jawaban kanonik
 
     def test_context_overflow_is_clear_error(self):

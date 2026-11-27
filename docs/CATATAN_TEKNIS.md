@@ -332,3 +332,10 @@ butuh atomik lintas TG → urutan tidak tetap → tidak bit-identik. Jangan dico
 - Pemilihan: live (bila seluruh cache prefix) ≥ checkpoint terpanjang > snapshot bake > reset.
 - LRU di RAM, `BIHABA_CKPT_MB` (default 2048, 0 = mati); `clear_state` mengosongkan semua.
   Stats `done`: `ckpt` (posisi restore), `ckpts`, `ckpt_mb`. Engine transformer TIDAK diubah.
+
+### 11.1 Hasil uji manual dan keputusan (1.7.0.dev4)
+
+Qwythos-9B, Web Console, jalur kanonik + checkpoint: `reuse 512`, prefill 4.63 s untuk jawaban lama ±1000 token.
+Checkpoint bekerja dan identik dengan acuan, tetapi jalur kanonik wajib mem-prefill ulang jawaban lama → jauh lebih
+lambat dari sesi token-persis (~0.3 s). Keputusan: qwen35 kembali ke sesi token-persis sebagai default; checkpoint
+tetap aktif sebagai cadangan jalur kanonik (sesi meleset, riwayat diedit, klien API, `regress_chat`/`uji_semua`).
