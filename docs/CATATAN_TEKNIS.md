@@ -279,3 +279,24 @@ Setiap baris output `Overhead/token` mencantumkan kelasnya; hasil satu kelas tid
 
 Keputusan per kelas: d besar → Fase 1a (pipelining N=1, greedy bit-identik); b − c besar → kurangi barrier;
 b besar → fusi (Fase 1b, hanya yang bit-identik).
+
+### 10.1 Hasil Fase 0 (M1 Max, decode M=1, 64 token)
+
+| Kelas | dispatch / barrier | (a) GPU | (b) kosong | (c) tanpa barrier | (d) encode | celah total−GPU |
+|---|---|---|---|---|---|---|
+| transformer 0.3B | 284 / 227 | 2.397 ms | 0.440 (18%) | 0.087 | 0.119 ms | 0.402 ms (14%) |
+| transformer 1.7B | 284 / 227 | 6.929 ms | 0.518 (7%) | 0.160 | 0.140 ms | 0.510 ms (7%) |
+| qwen35 dense 9B | 260 / 259 | 21.082 ms | 0.616 (3%) | 0.260 | 0.148 ms | 0.544 ms (2.5%) |
+| qwen35 MoE topK=4 | 524 / 443 | 9.629 ms | 0.909 (9%) | 0.256 | 0.250 ms | 0.648 ms (6%) |
+
+Kesimpulan: biaya tetap dispatch+barrier 1.5–2.4 µs (bukan 7 µs perkiraan); encode CPU kecil (1–4%);
+celah sinkron total−GPU adalah GPU menganggur → target pipelining. Kerugian terbesar ada di kerja kernel:
+0.3B 1.96 ms vs ideal 0.53 ms, MoE 8.7 vs 4.6 ms. qwen35 dense tidak layak diubah di sisi dispatch.
+
+### 10.2 Fase 0b (1.7.0.dev2): biaya barrier nyata + atribusi per kelompok kernel
+
+- (e) `ovh_mode 3`: kernel asli, barrier dilewati (output salah, hanya waktu). a − e = biaya barrier
+  termasuk *drain* (menunggu threadgroup paling lambat) yang tidak tertangkap kernel kosong.
+- (f) `ovh_mode 4`: satu kelompok kernel dikosongkan per run. a − f = biaya kelompok itu.
+  Kelompok dari nama fungsi Metal (dicatat di `make_pso`); lm_head dipisah lewat `cur_head`.
+- Jalur produksi: `set_pso` langsung `setComputePipelineState` bila `ovh_mode == 0` (tanpa lookup).

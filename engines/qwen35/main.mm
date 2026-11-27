@@ -211,6 +211,25 @@ struct FastSuffixSpeculator {
     }
 };
 
+// ─── Fase 0b: kelompok kernel untuk atribusi waktu (dari nama fungsi Metal, dicatat di make_pso) ───
+enum { G_NORM, G_PROJ, G_FFN, G_ROPE, G_ATTN, G_DN, G_ROUTER, G_EXPERT, G_COMBINE, G_HEAD, G_OTHER, G_N };
+static const char* const G_NAMES[G_N] = {"norm", "proyeksi qmv", "ffn swiglu", "qknorm/rope", "attention",
+                                         "deltanet", "moe router", "moe expert", "moe combine", "lm_head", "lainnya"};
+static std::unordered_map<const void*, int> g_pso_grp;
+static int kernel_group(const char* fn) {
+    auto pre = [&](const char* p) { return strncmp(fn, p, strlen(p)) == 0; };
+    if (pre("rms_norm")) return G_NORM;
+    if (pre("dense_swiglu")) return G_FFN;
+    if (pre("qmv_") || pre("qmm_") || pre("q35_qkv_proj") || pre("deltanet_in_proj")) return G_PROJ;
+    if (pre("q35_qknorm_rope") || pre("tr_qknorm_rope")) return G_ROPE;
+    if (pre("gqa_attention") || pre("attn_split") || pre("attn_merge")) return G_ATTN;
+    if (pre("deltanet_")) return G_DN;
+    if (pre("moe_router") || pre("moe_topk")) return G_ROUTER;
+    if (pre("moe_swiglu") || pre("moe_down")) return G_EXPERT;
+    if (pre("moe_combine")) return G_COMBINE;
+    return G_OTHER;
+}
+
 static id<MTLComputePipelineState> make_pso(
     id<MTLDevice> dev, id<MTLLibrary> lib, const char* fn, bool add_res = false, bool is_bf16 = false)
 {
@@ -222,6 +241,7 @@ static id<MTLComputePipelineState> make_pso(
     if (!f) { fprintf(stderr, "Missing/invalid Metal fn %s: %s\n", fn, [[err localizedDescription] UTF8String]); exit(1); }
     id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:f error:&err];
     if (!pso) { fprintf(stderr, "PSO error %s: %s\n", fn, [[err localizedDescription] UTF8String]); exit(1); }
+    g_pso_grp[(__bridge const void*)pso] = kernel_group(fn);
     return pso;
 }
 
@@ -326,9 +346,20 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_null = nil;
     long n_disp = 0, n_bar = 0;         // penghitung kumulatif (dibaca oleh bench_overhead)
     double last_enc_ms = 0.0;           // waktu CPU: awal run_step_m → tepat sebelum commit
+    //   ovh_mode 3: kernel ASLI tanpa barrier (output salah; hanya waktu) → a−e = biaya barrier nyata termasuk drain
+    //   ovh_mode 4: hanya kelompok ovh_grp yang dikosongkan → a−f = biaya kelompok itu
+    int ovh_grp = -1;
+    bool ovh_count = false, cur_head = false;
+    long n_disp_grp[G_N] = {0};
     inline void set_pso(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p) {
         ++n_disp;
-        [e setComputePipelineState:(ovh_mode ? pso_null : p)];
+        if (ovh_mode == 0 && !ovh_count) { [e setComputePipelineState:p]; return; }   // jalur produksi
+        int g = G_OTHER;
+        if (cur_head) g = G_HEAD;
+        else { auto it = g_pso_grp.find((__bridge const void*)p); if (it != g_pso_grp.end()) g = it->second; }
+        ++n_disp_grp[g];
+        const bool nul = ovh_mode == 1 || ovh_mode == 2 || (ovh_mode == 4 && g == ovh_grp);
+        [e setComputePipelineState:(nul ? pso_null : p)];
     }
 
     // ─── Roofline: byte yang WAJIB dibaca per token decode vs bandwidth memori terukur ───
@@ -1258,7 +1289,7 @@ struct Qwen35Engine {
 
     inline void bar(id<MTLComputeCommandEncoder> e) {
         ++n_bar;
-        if (ovh_mode == 2) return;
+        if (ovh_mode == 2 || ovh_mode == 3) return;
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
@@ -1615,7 +1646,9 @@ struct Qwen35Engine {
             [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             bar(e);
 
+            cur_head = true;
             enc_qmv(e, HM, b_xn, lm_head, b_logits, false);
+            cur_head = false;
             bar(e);
             if (!head_last_only && rep_active(rp) && rp.M == M) {
                 set_pso(e, pso_rep);
@@ -1671,9 +1704,14 @@ struct Qwen35Engine {
         const RepRowsParams rp{};
         struct R { double wall = 0, gpu = 0, enc = 0; };
         long nd = 0, nb = 0;
+        long ng[G_N] = {0};
         {   int32_t t = 9707; reset_states();
             const long d0 = n_disp, b0 = n_bar;
+            for (int g = 0; g < G_N; ++g) n_disp_grp[g] = 0;
+            ovh_count = true;
             run_step_m(&t, 1, 0, &t, true, rp);
+            ovh_count = false;
+            for (int g = 0; g < G_N; ++g) ng[g] = n_disp_grp[g];
             nd = n_disp - d0; nb = n_bar - b0; }
         auto run = [&](int mode) {
             R r; int32_t tok = 9707;
@@ -1703,6 +1741,19 @@ struct Qwen35Engine {
                a.enc, a.wall > 0 ? 100.0 * a.enc / a.wall : 0.0, a.wall - a.gpu);
         printf("   => kerja nyata ~ a-b = %.3f ms | overhead GPU (b) = %.0f%% dari GPU normal\n",
                a.gpu - b.gpu, a.gpu > 0 ? 100.0 * b.gpu / a.gpu : 0.0);
+        // Fase 0b
+        const R ee = run(3);
+        printf("   (e) asli tanpa barrier: GPU %.3f ms -> biaya barrier nyata (termasuk drain) a-e = %.3f ms = %.2f us/barrier (%.0f%% dari GPU)\n",
+               ee.gpu, a.gpu - ee.gpu, nb ? 1e3 * (a.gpu - ee.gpu) / double(nb) : 0.0,
+               a.gpu > 0 ? 100.0 * (a.gpu - ee.gpu) / a.gpu : 0.0);
+        printf("   (f) atribusi: kelompok dikosongkan -> GPU yang hilang (a-f), per dispatch\n");
+        for (int g = 0; g < G_N; ++g) {
+            if (ng[g] == 0) continue;
+            ovh_grp = g; const R f = run(4); ovh_grp = -1;
+            const double ms = a.gpu - f.gpu;
+            printf("       %-13s %4ld disp : %7.3f ms (%3.0f%%) | %.2f us/disp\n", G_NAMES[g], ng[g], ms,
+                   a.gpu > 0 ? 100.0 * ms / a.gpu : 0.0, 1e3 * ms / double(ng[g]));
+        }
     }
 
     // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
