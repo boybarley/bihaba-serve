@@ -250,3 +250,32 @@ Percakapan 3 giliran, greedy. A = riwayat dirender ulang secara kanonik, B = cac
 - **Kenapa hanya transformer yang diaktifkan:** di engine qwen35 hanya ¼ layer yang memakai attention, sehingga untungnya kecil. Di MoE, greedy menyimpang di token 32. Kemungkinan itu seri fp16 yang diperbesar routing expert, tapi belum dibuktikan. Bench v1.6 kini mencetak selisih logit top-1/top-2 di titik beda untuk membuktikannya. Uji di qwen35: `BIHABA_ATTN_SPLIT=1024`.
 - **Regresi chat** (`regress_chat.py --compare`, 4 model): **LULUS**, semua jawaban identik dengan versi stabil.
 - **Kesalahan yang sempat lolos:** variabel `threadgroup` di fungsi pembantu (aturan Metal yang sudah tercatat). Sekarang dicegah oleh `TestMetalLint` di tes offline.
+
+## 10. bihaba-next Fase 0: instrumen overhead dispatch/barrier (1.7.0.dev1)
+
+Tujuan: mengukur langsung, bukan menghitung, berapa biaya dispatch + barrier per token decode, sebelum
+memutuskan Fase 1 (pipelining CPU/GPU atau fusi kernel). **Tidak ada kernel produksi yang berubah.**
+
+- `set_pso()` menggantikan `setComputePipelineState` di jalur encode; `bar()` menghitung barrier.
+  Dengan `ovh_mode = 0` (selalu, kecuali di dalam `bench_overhead`) perilakunya identik dengan v1.6.2.
+- `null_kernel` (kernel kosong) dipakai dengan grid, buffer, dan barrier yang SAMA dengan kernel asli,
+  agar biaya peluncuran threadgroup tetap terhitung.
+- Opt-in: `BIHABA_BENCH_OVERHEAD=1 bihaba-serve bench --model … --tokens 128`. Tanpa env ini output bench sama.
+
+| Ukuran | Cara | Arti |
+|---|---|---|
+| a | step normal (`GPUStartTime`/`GPUEndTime`) | waktu GPU total |
+| b | semua kernel kosong, grid + barrier sama | batas atas overhead dispatch + barrier |
+| c | seperti b, barrier dilewati | overhead dispatch saja (b − c = barrier) |
+| d | jam CPU dari awal `run_step_m` sampai tepat sebelum `commit` | encode CPU yang bisa disembunyikan pipelining |
+
+Kelas dibaca dan diputuskan TERPISAH — engine boleh sama (qwen35), arsitekturnya tidak:
+- transformer kecil/menengah: semua layer attention, ~10 dispatch/layer; overhead dominan di model kecil.
+- qwen35 dense: 3/4 layer DeltaNet + 1/4 attention, FFN dense; dekat batas bandwidth → overhead porsi kecil.
+- qwen35 MoE: DeltaNet/attention + router + top-k expert + shared expert + combine (~13 dispatch/layer);
+  byte per token kecil tetapi dispatch terbanyak → overhead porsi terbesar. Angka MoE selalu dicatat beserta topK.
+Grid kernel expert tidak bergantung pada routing (ditentukan CPU sebelum encode), jadi mode kernel kosong tetap sah untuk MoE.
+Setiap baris output `Overhead/token` mencantumkan kelasnya; hasil satu kelas tidak dipakai untuk kelas lain.
+
+Keputusan per kelas: d besar → Fase 1a (pipelining N=1, greedy bit-identik); b − c besar → kurangi barrier;
+b besar → fusi (Fase 1b, hanya yang bit-identik).

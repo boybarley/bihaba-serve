@@ -281,6 +281,18 @@ struct TransformerEngine {
     static constexpr int ATTN_MAX_BLK = 32;
     double last_gpu_ms = 0.0;           // durasi GPU command buffer run_step terakhir
 
+    // ─── Fase 0: instrumen overhead (ovh_mode=0 di luar bench_overhead → jalur produksi tidak berubah) ───
+    //   ovh_mode 1: semua kernel diganti null_kernel (grid, buffer, barrier sama) → sisa = biaya dispatch+barrier
+    //   ovh_mode 2: seperti 1 tetapi barrier dilewati → sisa = biaya dispatch saja
+    int ovh_mode = 0;
+    id<MTLComputePipelineState> pso_null = nil;
+    long n_disp = 0, n_bar = 0;         // penghitung kumulatif (dibaca oleh bench_overhead)
+    double last_enc_ms = 0.0;           // waktu CPU: awal run_step_m → tepat sebelum commit
+    inline void set_pso(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p) {
+        ++n_disp;
+        [e setComputePipelineState:(ovh_mode ? pso_null : p)];
+    }
+
     // ─── Roofline: byte yang WAJIB dibaca per token decode vs bandwidth memori terukur ───
     static double qt_bytes(const QTensor& q) {
         if (q.N <= 0 || q.K <= 0) return 0.0;
@@ -665,6 +677,7 @@ struct TransformerEngine {
         const bool bf = scales_bf16;
         pso_embed         = make_pso(dev, lib, "embed_lookup_q",          false, bf);
         pso_rms           = make_pso(dev, lib, "rms_norm",                false, bf);
+        pso_null          = make_pso(dev, lib, "null_kernel",             false, bf);
         pso_rep           = make_pso(dev, lib, "apply_rep_penalty_rows",  false, bf);
         pso_qmm4_mmaP     = make_pso(dev, lib, "qmm_4b_mmaP",             false, bf);
         pso_qmm4_mmaP_add = make_pso(dev, lib, "qmm_4b_mmaP",             true,  bf);
@@ -749,7 +762,11 @@ struct TransformerEngine {
     }
 
     void reset_states() { cached_ids.clear(); }
-    inline void bar(id<MTLComputeCommandEncoder> e) { [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+    inline void bar(id<MTLComputeCommandEncoder> e) {
+        ++n_bar;
+        if (ovh_mode == 2) return;
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
 
     void capture_snapshot(StateSnapshot& snap, const std::vector<int32_t>& ids, int pos) {
         snap.ids = ids; snap.pos = pos;
@@ -858,7 +875,7 @@ struct TransformerEngine {
         } else {
             pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
         }
-        [e setComputePipelineState:pso];
+        set_pso(e, pso);
         [e setBuffer:inp offset:ioff atIndex:0];
         [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
         [e setBuffer:outp offset:ooff atIndex:4];
@@ -881,7 +898,7 @@ struct TransformerEngine {
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
         const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
-        [e setComputePipelineState:pso];
+        set_pso(e, pso);
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
         [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
         [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
@@ -893,7 +910,7 @@ struct TransformerEngine {
     void enc_layer(id<MTLComputeCommandEncoder> e, int M, int l, int pos) {
         const auto& L = layers[l];
         NormParams np{dim, rms_eps};
-        [e setComputePipelineState:pso_rms];
+        set_pso(e, pso_rms);
         [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.in_norm.buf offset:L.in_norm.off atIndex:1];
         [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -906,7 +923,7 @@ struct TransformerEngine {
         bar(e);
 
         TrRopeParams rp{M, n_heads, n_kv_heads, head_dim, pos, max_seq, L.has_qkv_bias ? 1 : 0, L.has_qk_norm ? 1 : 0, rms_eps};
-        [e setComputePipelineState:pso_qk_rope];
+        set_pso(e, pso_qk_rope);
         [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:b_k offset:0 atIndex:1]; [e setBuffer:b_v offset:0 atIndex:2];
         [e setBuffer:k_caches[l] offset:0 atIndex:3]; [e setBuffer:v_caches[l] offset:0 atIndex:4];
         [e setBuffer:cos_s.buf offset:cos_s.off atIndex:5]; [e setBuffer:sin_s.buf offset:sin_s.off atIndex:6];
@@ -921,19 +938,19 @@ struct TransformerEngine {
             // Konteks panjang: bagi sekuens ke n_blk threadgroup per head (≈256 token per blok), lalu gabungkan.
             const int nblk = std::min(int(ATTN_MAX_BLK), (pos + M + 255) / 256);
             AttnSplitParams ap{M, n_heads, n_kv_heads, pos, max_seq, nblk};
-            [e setComputePipelineState:pso_attn_split];
+            set_pso(e, pso_attn_split);
             [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:k_caches[l] offset:0 atIndex:1]; [e setBuffer:v_caches[l] offset:0 atIndex:2];
             [e setBuffer:b_part_ml offset:0 atIndex:3]; [e setBuffer:b_part_o offset:0 atIndex:4]; [e setBytes:&ap length:sizeof(ap) atIndex:5];
             [e dispatchThreadgroups:MTLSizeMake(n_heads, nblk, M) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             bar(e);
-            [e setComputePipelineState:pso_attn_merge];
+            set_pso(e, pso_attn_merge);
             [e setBuffer:b_part_ml offset:0 atIndex:0]; [e setBuffer:b_part_o offset:0 atIndex:1]; [e setBuffer:b_q offset:0 atIndex:2];
             [e setBuffer:b_att offset:0 atIndex:3]; [e setBytes:&ap length:sizeof(ap) atIndex:4];
             [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             bar(e);
         } else {
             TrGQAParams gp{M, n_heads, n_kv_heads, pos, max_seq};
-            [e setComputePipelineState:pso_gqa];
+            set_pso(e, pso_gqa);
             [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:k_caches[l] offset:0 atIndex:1];
             [e setBuffer:v_caches[l] offset:0 atIndex:2]; [e setBuffer:b_att offset:0 atIndex:3];
             [e setBytes:&gp length:sizeof(gp) atIndex:4];
@@ -944,7 +961,7 @@ struct TransformerEngine {
         enc_qmv(e, M, b_att, L.o, b_x, true);
         bar(e);
 
-        [e setComputePipelineState:pso_rms];
+        set_pso(e, pso_rms);
         [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.post_norm.buf offset:L.post_norm.off atIndex:1];
         [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -965,6 +982,7 @@ struct TransformerEngine {
             fprintf(stderr, "✗ run_step di luar batas: pos=%d M=%d max_seq=%d\n", pos, M, max_seq);
             exit(1);
         }
+        const auto t_enc0 = std::chrono::steady_clock::now();
         memcpy([b_tok contents], ids, size_t(M) * sizeof(int32_t));
         @autoreleasepool {   // daemon jalan berjam-jam: lepas objek Metal sementara tiap langkah
         id<MTLCommandBuffer> cb = [queue commandBufferWithUnretainedReferences];
@@ -972,7 +990,7 @@ struct TransformerEngine {
 
         QMVParams ep{dim, vocab, embed.gs_shift};
         int ebits = embed.bits;
-        [e setComputePipelineState:pso_embed];
+        set_pso(e, pso_embed);
         [e setBuffer:b_tok offset:0 atIndex:0];
         [e setBuffer:embed.w_buf offset:embed.w atIndex:1]; [e setBuffer:embed.s_buf offset:embed.s atIndex:2]; [e setBuffer:embed.b_buf offset:embed.b atIndex:3];
         [e setBuffer:b_x offset:0 atIndex:4]; [e setBytes:&ep length:sizeof(ep) atIndex:5]; [e setBytes:&ebits length:sizeof(ebits) atIndex:6];
@@ -984,7 +1002,7 @@ struct TransformerEngine {
         const int HM = head_last_only ? 1 : M;
         if (run_head) {
             NormParams np{dim, rms_eps};
-            [e setComputePipelineState:pso_rms];
+            set_pso(e, pso_rms);
             [e setBuffer:b_x offset:(head_last_only ? NSUInteger(M - 1) * NSUInteger(dim) * 2 : 0) atIndex:0];
             [e setBuffer:fnorm_s.buf offset:fnorm_s.off atIndex:1];
             [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
@@ -994,25 +1012,27 @@ struct TransformerEngine {
             enc_qmv(e, HM, b_xn, lm_head, b_logits, false);
             bar(e);
             if (!head_last_only && rep_active(rp) && rp.M == M) {
-                [e setComputePipelineState:pso_rep];
+                set_pso(e, pso_rep);
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBytes:&rp length:sizeof(rp) atIndex:1];
                 [e dispatchThreads:MTLSizeMake(REP_WIN, M, 1) threadsPerThreadgroup:MTLSizeMake(REP_WIN, 1, 1)];
                 bar(e);
             }
             if (want_top64) {
-                [e setComputePipelineState:pso_topk64];
+                set_pso(e, pso_topk64);
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBuffer:b_top64_ids offset:0 atIndex:1];
                 [e setBuffer:b_top64_vals offset:0 atIndex:2]; [e setBytes:&vocab length:sizeof(vocab) atIndex:3];
                 [e setBuffer:b_top64_flag offset:0 atIndex:4];
                 [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                [e setComputePipelineState:pso_argmax];
+                set_pso(e, pso_argmax);
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBuffer:b_out_tok offset:0 atIndex:1];
                 [e setBytes:&vocab length:sizeof(vocab) atIndex:2];
                 [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
         }
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        [e endEncoding];
+        last_enc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_enc0).count();
+        [cb commit]; [cb waitUntilCompleted];
         if (gpu_ms_out) *gpu_ms_out = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         last_gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         if (run_head) {
@@ -1029,6 +1049,49 @@ struct TransformerEngine {
             }
         }
         }
+    }
+
+
+    // ─── Fase 0: biaya dispatch/barrier per token decode M=1 ───
+    //   (a) step normal  (b) semua kernel kosong, grid & barrier sama  (c) seperti (b) tanpa barrier
+    //   (d) waktu encode CPU per step. b = batas ATAS overhead GPU (di (a) sebagian bisa tumpang-tindih dengan kerja).
+    void bench_overhead(int n) {
+        if (!pso_null) { printf("▸ Overhead: null_kernel tidak tersedia\n"); return; }
+        n = std::max(8, std::min(n, max_seq - 8));
+        const RepRowsParams rp{};
+        struct R { double wall = 0, gpu = 0, enc = 0; };
+        long nd = 0, nb = 0;
+        {   int32_t t = 9707; reset_states();
+            const long d0 = n_disp, b0 = n_bar;
+            run_step_m(&t, 1, 0, &t, true, rp);
+            nd = n_disp - d0; nb = n_bar - b0; }
+        auto run = [&](int mode) {
+            R r; int32_t tok = 9707;
+            ovh_mode = mode;
+            for (int i = 0; i < 4; ++i) run_step_m(&tok, 1, i, &tok, true, rp);   // pemanasan
+            reset_states(); tok = 9707;
+            for (int i = 0; i < n; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                run_step_m(&tok, 1, i, &tok, true, rp);
+                r.wall += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                r.gpu += last_gpu_ms; r.enc += last_enc_ms;
+                if (mode) tok = 9707;          // kernel kosong tidak menulis token
+            }
+            ovh_mode = 0; reset_states();
+            r.wall /= n; r.gpu /= n; r.enc /= n;
+            return r;
+        };
+        const R a = run(0), b = run(1), c = run(2);
+        printf("▸ Overhead/token [kelas: transformer, %d layer] (decode M=1, %d tok): %ld dispatch, %ld barrier per step\n", n_layers, n, nd, nb);
+        printf("   (a) normal        : GPU %.3f ms | encode CPU %.3f ms | total %.3f ms\n", a.gpu, a.enc, a.wall);
+        printf("   (b) kernel kosong : GPU %.3f ms -> %.2f us/dispatch (termasuk barrier) | total %.3f ms\n",
+               b.gpu, nd ? 1e3 * b.gpu / double(nd) : 0.0, b.wall);
+        printf("   (c) tanpa barrier : GPU %.3f ms -> barrier ~ %.2f us/buah, dispatch ~ %.2f us/buah\n",
+               c.gpu, nb ? 1e3 * (b.gpu - c.gpu) / double(nb) : 0.0, nd ? 1e3 * c.gpu / double(nd) : 0.0);
+        printf("   (d) encode CPU    : %.3f ms/token = %.0f%% dari total | celah total-GPU %.3f ms\n",
+               a.enc, a.wall > 0 ? 100.0 * a.enc / a.wall : 0.0, a.wall - a.gpu);
+        printf("   => kerja nyata ~ a-b = %.3f ms | overhead GPU (b) = %.0f%% dari GPU normal\n",
+               a.gpu - b.gpu, a.gpu > 0 ? 100.0 * b.gpu / a.gpu : 0.0);
     }
 
     // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
@@ -1316,6 +1379,10 @@ int main(int argc, char** argv) {
                 printf("▸ Waktu/token: total %.2f ms | GPU %.2f ms | CPU+sinkron %.2f ms (%.0f%%) | ideal-bandwidth %.2f ms\n",
                        wall_tok, gpu_tok, wall_tok - gpu_tok, 100.0 * (wall_tok - gpu_tok) / wall_tok,
                        gbs > 0 ? mb_tok / gbs : 0.0);
+            }
+
+            if (const char* ov = getenv("BIHABA_BENCH_OVERHEAD")) {   // Fase 0 (opt-in): biaya dispatch/barrier
+                if (atoi(ov) > 0) eng.bench_overhead(std::max(64, bench_toks / 2));
             }
 
             {   // Decode di konteks panjang: attention lama vs split-sequence (hasil greedy harus identik)

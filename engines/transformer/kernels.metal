@@ -1422,3 +1422,6 @@ DECL_ATTN_SPLIT(attn_split_256, 256)
 DECL_ATTN_MERGE(attn_merge_64, 64, false)
 DECL_ATTN_MERGE(attn_merge_128, 128, false)
 DECL_ATTN_MERGE(attn_merge_256, 256, false)
+
+// Fase 0: kernel kosong untuk mengukur biaya dispatch/barrier murni (dipakai hanya oleh bench_overhead)
+kernel void null_kernel() {}

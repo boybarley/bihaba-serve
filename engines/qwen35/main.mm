@@ -319,6 +319,18 @@ struct Qwen35Engine {
     static constexpr int ATTN_MAX_BLK = 32;
     double last_gpu_ms = 0.0;           // durasi GPU command buffer run_step terakhir
 
+    // ─── Fase 0: instrumen overhead (ovh_mode=0 di luar bench_overhead → jalur produksi tidak berubah) ───
+    //   ovh_mode 1: semua kernel diganti null_kernel (grid, buffer, barrier sama) → sisa = biaya dispatch+barrier
+    //   ovh_mode 2: seperti 1 tetapi barrier dilewati → sisa = biaya dispatch saja
+    int ovh_mode = 0;
+    id<MTLComputePipelineState> pso_null = nil;
+    long n_disp = 0, n_bar = 0;         // penghitung kumulatif (dibaca oleh bench_overhead)
+    double last_enc_ms = 0.0;           // waktu CPU: awal run_step_m → tepat sebelum commit
+    inline void set_pso(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p) {
+        ++n_disp;
+        [e setComputePipelineState:(ovh_mode ? pso_null : p)];
+    }
+
     // ─── Roofline: byte yang WAJIB dibaca per token decode vs bandwidth memori terukur ───
     static double qt_bytes(const QTensor& q) {
         if (q.N <= 0 || q.K <= 0) return 0.0;
@@ -934,6 +946,7 @@ struct Qwen35Engine {
         const bool bf = scales_bf16;
         pso_embed         = make_pso(dev, lib, "embed_lookup_q",          false, bf);
         pso_rms           = make_pso(dev, lib, "rms_norm",                false, bf);
+        pso_null          = make_pso(dev, lib, "null_kernel",             false, bf);
         pso_rep           = make_pso(dev, lib, "apply_rep_penalty_rows",  false, bf);
         pso_qmm4_mmaP     = make_pso(dev, lib, "qmm_4b_mmaP",             false, bf);
         pso_qmm4_mmaP_add = make_pso(dev, lib, "qmm_4b_mmaP",             true,  bf);
@@ -1244,6 +1257,8 @@ struct Qwen35Engine {
     }
 
     inline void bar(id<MTLComputeCommandEncoder> e) {
+        ++n_bar;
+        if (ovh_mode == 2) return;
         [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
@@ -1252,14 +1267,14 @@ struct Qwen35Engine {
         for (int l = 0; l < n_layers; ++l) {
             if (layers[l].type != 0) continue;
             Conv1dParams cp{n_acc, qkv_lin_dim, conv_k};
-            [e setComputePipelineState:pso_commit_conv];
+            set_pso(e, pso_commit_conv);
             [e setBuffer:conv_states[l] offset:0 atIndex:0];
             [e setBuffer:conv_hist[l]   offset:0 atIndex:1];
             [e setBytes:&cp length:sizeof(cp) atIndex:2];
             [e dispatchThreads:MTLSizeMake(qkv_lin_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
             DeltaNetParams dp{n_acc, lin_kh, lin_vh, lin_khd, lin_vhd, rms_eps};
-            [e setComputePipelineState:pso_commit_dn];
+            set_pso(e, pso_commit_dn);
             [e setBuffer:dn_states[l]   offset:0 atIndex:0];
             [e setBuffer:dn_hist_k[l]   offset:0 atIndex:1];
             [e setBuffer:dn_hist_d[l]   offset:0 atIndex:2];
@@ -1294,7 +1309,7 @@ struct Qwen35Engine {
         } else {
             pso = add_res ? pso_qmvm_add[qt.bits] : pso_qmvm[qt.bits]; rows_per_tg = 4;
         }
-        [e setComputePipelineState:pso];
+        set_pso(e, pso);
         [e setBuffer:inp offset:ioff atIndex:0];
         [e setBuffer:qt.w_buf offset:qt.w atIndex:1]; [e setBuffer:qt.s_buf offset:qt.s atIndex:2]; [e setBuffer:qt.b_buf offset:qt.b atIndex:3];
         [e setBuffer:outp offset:ooff atIndex:4];
@@ -1317,7 +1332,7 @@ struct Qwen35Engine {
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
             : pso_sw[gp.bits];
         const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
-        [e setComputePipelineState:pso];
+        set_pso(e, pso);
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
         [e setBuffer:gp.w_buf offset:gp.w atIndex:1]; [e setBuffer:gp.s_buf offset:gp.s atIndex:2]; [e setBuffer:gp.b_buf offset:gp.b atIndex:3];
         [e setBuffer:up.w_buf offset:up.w atIndex:4]; [e setBuffer:up.s_buf offset:up.s atIndex:5]; [e setBuffer:up.b_buf offset:up.b atIndex:6];
@@ -1331,7 +1346,7 @@ struct Qwen35Engine {
     void enc_layer_attn(id<MTLComputeCommandEncoder> e, int M, int l, int pos, bool prefill = false) {
         const auto& L = layers[l];
         NormParams np{dim, rms_eps};
-        [e setComputePipelineState:pso_rms];
+        set_pso(e, pso_rms);
         [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.in_norm.buf offset:L.in_norm.off atIndex:1];
         [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1346,7 +1361,7 @@ struct Qwen35Engine {
                 const bool mma = (M >= 4 && (dim % 64 == 0));
                 id<MTLComputePipelineState> pso_dn = (M == 1) ? pso_dn_in4_m1 : (mma ? (M > MAX_M ? pso_dn_in4_mmaP : pso_dn_in4_mma8) : pso_dn_in4);
                 int rpt_dn = (M == 1) ? 8 : (mma ? 32 : 4);
-                [e setComputePipelineState:pso_dn];
+                set_pso(e, pso_dn);
                 [e setBuffer:b_xn offset:0 atIndex:0];
                 [e setBuffer:L.in_qkv.w_buf offset:L.in_qkv.w atIndex:1];  [e setBuffer:L.in_qkv.s_buf offset:L.in_qkv.s atIndex:2];  [e setBuffer:L.in_qkv.b_buf offset:L.in_qkv.b atIndex:3];
                 [e setBuffer:L.in_z.w_buf   offset:L.in_z.w   atIndex:4];  [e setBuffer:L.in_z.s_buf   offset:L.in_z.s   atIndex:5];  [e setBuffer:L.in_z.b_buf   offset:L.in_z.b   atIndex:6];
@@ -1369,17 +1384,17 @@ struct Qwen35Engine {
 
             Conv1dParams cp{M, qkv_lin_dim, conv_k};
             if (prefill && M > 1) {
-                [e setComputePipelineState:pso_conv1d_prefill];
+                set_pso(e, pso_conv1d_prefill);
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:conv_states[l] offset:0 atIndex:1];
                 [e setBuffer:L.conv_w.buf offset:L.conv_w.off atIndex:2]; [e setBytes:&cp length:sizeof(cp) atIndex:3];
                 [e dispatchThreads:MTLSizeMake(qkv_lin_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else if (M == 1) {
-                [e setComputePipelineState:pso_conv1d_m1];
+                set_pso(e, pso_conv1d_m1);
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:conv_states[l] offset:0 atIndex:1];
                 [e setBuffer:L.conv_w.buf offset:L.conv_w.off atIndex:2]; [e setBytes:&cp length:sizeof(cp) atIndex:3];
                 [e dispatchThreads:MTLSizeMake(qkv_lin_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                [e setComputePipelineState:pso_conv1d_spec];
+                set_pso(e, pso_conv1d_spec);
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:conv_states[l] offset:0 atIndex:1];
                 [e setBuffer:L.conv_w.buf offset:L.conv_w.off atIndex:2]; [e setBuffer:conv_hist[l] offset:0 atIndex:3];
                 [e setBytes:&cp length:sizeof(cp) atIndex:4];
@@ -1389,7 +1404,7 @@ struct Qwen35Engine {
 
             DeltaNetParams dp{M, lin_kh, lin_vh, lin_khd, lin_vhd, rms_eps};
             if (M == 1 || prefill) {
-                [e setComputePipelineState:(M == 1 ? pso_dn_m1 : pso_dn_prefill)];
+                set_pso(e, (M == 1 ? pso_dn_m1 : pso_dn_prefill));
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:b_z offset:0 atIndex:1];
                 [e setBuffer:b_a offset:0 atIndex:2];   [e setBuffer:b_b offset:0 atIndex:3];
                 [e setBuffer:L.A_log.buf offset:L.A_log.off atIndex:4]; [e setBuffer:L.dt_bias.buf offset:L.dt_bias.off atIndex:5];
@@ -1397,7 +1412,7 @@ struct Qwen35Engine {
                 [e setBuffer:b_dn_out offset:0 atIndex:8]; [e setBytes:&dp length:sizeof(dp) atIndex:9];
                 [e dispatchThreadgroups:MTLSizeMake(lin_vh, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                [e setComputePipelineState:pso_dn_spec];
+                set_pso(e, pso_dn_spec);
                 [e setBuffer:b_qkv offset:0 atIndex:0]; [e setBuffer:b_z offset:0 atIndex:1];
                 [e setBuffer:b_a offset:0 atIndex:2];   [e setBuffer:b_b offset:0 atIndex:3];
                 [e setBuffer:L.A_log.buf offset:L.A_log.off atIndex:4]; [e setBuffer:L.dt_bias.buf offset:L.dt_bias.off atIndex:5];
@@ -1420,7 +1435,7 @@ struct Qwen35Engine {
                 const bool mma = (M >= 4 && (dim % 64 == 0));
                 id<MTLComputePipelineState> pso_fq = (M == 1) ? pso_full_qkv4_m1 : (mma ? (M > MAX_M ? pso_full_qkv4_mmaP : pso_full_qkv4_mma8) : pso_full_qkv4);
                 int rpt_fq = (M == 1) ? 8 : (mma ? 32 : 4);
-                [e setComputePipelineState:pso_fq];
+                set_pso(e, pso_fq);
                 [e setBuffer:b_xn offset:0 atIndex:0];
                 [e setBuffer:L.q.w_buf offset:L.q.w atIndex:1]; [e setBuffer:L.q.s_buf offset:L.q.s atIndex:2]; [e setBuffer:L.q.b_buf offset:L.q.b atIndex:3];
                 [e setBuffer:L.k.w_buf offset:L.k.w atIndex:4]; [e setBuffer:L.k.s_buf offset:L.k.s atIndex:5]; [e setBuffer:L.k.b_buf offset:L.k.b atIndex:6];
@@ -1439,7 +1454,7 @@ struct Qwen35Engine {
             bar(e);
 
             QKNormRopeParams qp{M, n_heads, n_kv_heads, head_dim, rope_dim, pos, max_seq, rms_eps};
-            [e setComputePipelineState:pso_qk_rope];
+            set_pso(e, pso_qk_rope);
             [e setBuffer:b_q_raw offset:0 atIndex:0]; [e setBuffer:b_k offset:0 atIndex:1]; [e setBuffer:b_v offset:0 atIndex:2];
             [e setBuffer:b_q offset:0 atIndex:3]; [e setBuffer:b_gate offset:0 atIndex:4];
             [e setBuffer:k_caches[l] offset:0 atIndex:5]; [e setBuffer:v_caches[l] offset:0 atIndex:6];
@@ -1453,19 +1468,19 @@ struct Qwen35Engine {
                 // Konteks panjang: bagi sekuens ke n_blk threadgroup per head (≈256 token per blok), lalu gabungkan.
                 const int nblk = std::min(int(ATTN_MAX_BLK), (pos + M + 255) / 256);
                 AttnSplitParams ap{M, n_heads, n_kv_heads, pos, max_seq, nblk};
-                [e setComputePipelineState:pso_attn_split];
+                set_pso(e, pso_attn_split);
                 [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:k_caches[l] offset:0 atIndex:1]; [e setBuffer:v_caches[l] offset:0 atIndex:2];
                 [e setBuffer:b_part_ml offset:0 atIndex:3]; [e setBuffer:b_part_o offset:0 atIndex:4]; [e setBytes:&ap length:sizeof(ap) atIndex:5];
                 [e dispatchThreadgroups:MTLSizeMake(n_heads, nblk, M) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 bar(e);
-                [e setComputePipelineState:pso_attn_merge];
+                set_pso(e, pso_attn_merge);
                 [e setBuffer:b_part_ml offset:0 atIndex:0]; [e setBuffer:b_part_o offset:0 atIndex:1]; [e setBuffer:b_gate offset:0 atIndex:2];
                 [e setBuffer:b_att offset:0 atIndex:3]; [e setBytes:&ap length:sizeof(ap) atIndex:4];
                 [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                 bar(e);
             } else {
                 GQA256Params gp{M, n_heads, n_kv_heads, pos, max_seq};
-                [e setComputePipelineState:pso_gqa256];
+                set_pso(e, pso_gqa256);
                 [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:b_gate offset:0 atIndex:1];
                 [e setBuffer:k_caches[l] offset:0 atIndex:2]; [e setBuffer:v_caches[l] offset:0 atIndex:3];
                 [e setBuffer:b_att offset:0 atIndex:4]; [e setBytes:&gp length:sizeof(gp) atIndex:5];
@@ -1481,7 +1496,7 @@ struct Qwen35Engine {
     void enc_layer_ffn(id<MTLComputeCommandEncoder> e, int M, int l) {
         const auto& L = layers[l];
         NormParams np{dim, rms_eps};
-        [e setComputePipelineState:pso_rms];
+        set_pso(e, pso_rms);
         [e setBuffer:b_x offset:0 atIndex:0]; [e setBuffer:L.post_norm.buf offset:L.post_norm.off atIndex:1];
         [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1494,7 +1509,7 @@ struct Qwen35Engine {
                 for (int r0 = 0; r0 < M; r0 += MAX_M) {
                     const int mb = std::min(MAX_M, M - r0);
                     QMVMultiParams qp{mb, L.router.K, L.router.N, L.router.gs_shift};
-                    [e setComputePipelineState:(L.router.bits == 8 ? pso_router_sh8 : pso_router_sh4)];
+                    set_pso(e, (L.router.bits == 8 ? pso_router_sh8 : pso_router_sh4));
                     [e setBuffer:b_xn offset:NSUInteger(r0) * NSUInteger(L.router.K) * 2 atIndex:0];
                     [e setBuffer:L.router.w_buf  offset:L.router.w  atIndex:1]; [e setBuffer:L.router.s_buf  offset:L.router.s  atIndex:2]; [e setBuffer:L.router.b_buf  offset:L.router.b  atIndex:3];
                     [e setBuffer:L.sh_gate.w_buf offset:L.sh_gate.w atIndex:4]; [e setBuffer:L.sh_gate.s_buf offset:L.sh_gate.s atIndex:5]; [e setBuffer:L.sh_gate.b_buf offset:L.sh_gate.b atIndex:6];
@@ -1512,7 +1527,7 @@ struct Qwen35Engine {
 
             // Wave 2 (Concurrent): TopK+Softmax + Shared-Expert Down
             TopKParams tp{M, num_experts, top_k};
-            [e setComputePipelineState:pso_topk];
+            set_pso(e, pso_topk);
             [e setBuffer:b_router_l offset:0 atIndex:0]; [e setBuffer:b_sh_gl offset:0 atIndex:1];
             [e setBuffer:b_top_ids offset:0 atIndex:2];  [e setBuffer:b_top_w offset:0 atIndex:3];
             [e setBuffer:b_sh_g offset:0 atIndex:4];     [e setBytes:&tp length:sizeof(tp) atIndex:5];
@@ -1522,7 +1537,7 @@ struct Qwen35Engine {
 
             // Unified High-Occupancy Low-Register 3D Contiguous-Expert MoE (M=1..8!)
             MoEProjParams swp{M, L.moe_gp.K, L.moe_gp.N, top_k, L.moe_gp.gs_shift, L.moe_gp.stride_w, L.moe_gp.stride_s};
-            [e setComputePipelineState:pso_moe_sw1[L.moe_gp.bits]];
+            set_pso(e, pso_moe_sw1[L.moe_gp.bits]);
             [e setBuffer:b_xn offset:0 atIndex:0]; [e setBuffer:b_top_ids offset:0 atIndex:1];
             [e setBuffer:L.moe_gp.w_buf offset:L.moe_gp.w atIndex:2]; [e setBuffer:L.moe_gp.s_buf offset:L.moe_gp.s atIndex:3]; [e setBuffer:L.moe_gp.b_buf offset:L.moe_gp.b atIndex:4];
             [e setBuffer:L.moe_up.w_buf offset:L.moe_up.w atIndex:5]; [e setBuffer:L.moe_up.s_buf offset:L.moe_up.s atIndex:6]; [e setBuffer:L.moe_up.b_buf offset:L.moe_up.b atIndex:7];
@@ -1531,7 +1546,7 @@ struct Qwen35Engine {
             bar(e);
 
             MoEProjParams dnp{M, L.moe_dp.K, L.moe_dp.N, top_k, L.moe_dp.gs_shift, L.moe_dp.stride_w, L.moe_dp.stride_s};
-            [e setComputePipelineState:pso_moe_dn1[L.moe_dp.bits]];
+            set_pso(e, pso_moe_dn1[L.moe_dp.bits]);
             [e setBuffer:b_moe_h offset:0 atIndex:0]; [e setBuffer:b_top_ids offset:0 atIndex:1];
             [e setBuffer:L.moe_dp.w_buf offset:L.moe_dp.w atIndex:2]; [e setBuffer:L.moe_dp.s_buf offset:L.moe_dp.s atIndex:3]; [e setBuffer:L.moe_dp.b_buf offset:L.moe_dp.b atIndex:4];
             [e setBuffer:b_moe_out offset:0 atIndex:5]; [e setBytes:&dnp length:sizeof(dnp) atIndex:6];
@@ -1539,7 +1554,7 @@ struct Qwen35Engine {
             bar(e);
 
             TopKParams cp{M, dim >> 2, top_k};
-            [e setComputePipelineState:pso_combine];
+            set_pso(e, pso_combine);
             [e setBuffer:b_moe_out offset:0 atIndex:0]; [e setBuffer:b_top_w offset:0 atIndex:1];
             [e setBuffer:b_sh_out offset:0 atIndex:2];  [e setBuffer:b_sh_g offset:0 atIndex:3];
             [e setBuffer:b_x offset:0 atIndex:4];       [e setBytes:&cp length:sizeof(cp) atIndex:5];
@@ -1565,6 +1580,7 @@ struct Qwen35Engine {
             fprintf(stderr, "✗ run_step di luar batas: pos=%d M=%d max_seq=%d\n", pos, M, max_seq);
             exit(1);
         }
+        const auto t_enc0 = std::chrono::steady_clock::now();
         memcpy([b_tok contents], ids, size_t(M) * sizeof(int32_t));
         @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue commandBufferWithUnretainedReferences];
@@ -1577,7 +1593,7 @@ struct Qwen35Engine {
 
         QMVParams ep{dim, vocab, embed.gs_shift};
         int ebits = embed.bits;
-        [e setComputePipelineState:pso_embed];
+        set_pso(e, pso_embed);
         [e setBuffer:b_tok offset:0 atIndex:0];
         [e setBuffer:embed.w_buf offset:embed.w atIndex:1]; [e setBuffer:embed.s_buf offset:embed.s atIndex:2]; [e setBuffer:embed.b_buf offset:embed.b atIndex:3];
         [e setBuffer:b_x offset:0 atIndex:4]; [e setBytes:&ep length:sizeof(ep) atIndex:5]; [e setBytes:&ebits length:sizeof(ebits) atIndex:6];
@@ -1592,7 +1608,7 @@ struct Qwen35Engine {
         const int HM = head_last_only ? 1 : M;
         if (run_head) {
             NormParams np{dim, rms_eps};
-            [e setComputePipelineState:pso_rms];
+            set_pso(e, pso_rms);
             [e setBuffer:b_x offset:(head_last_only ? NSUInteger(M - 1) * NSUInteger(dim) * 2 : 0) atIndex:0];
             [e setBuffer:fnorm_s.buf offset:fnorm_s.off atIndex:1];
             [e setBuffer:b_xn offset:0 atIndex:2]; [e setBytes:&np length:sizeof(np) atIndex:3];
@@ -1602,13 +1618,13 @@ struct Qwen35Engine {
             enc_qmv(e, HM, b_xn, lm_head, b_logits, false);
             bar(e);
             if (!head_last_only && rep_active(rp) && rp.M == M) {
-                [e setComputePipelineState:pso_rep];
+                set_pso(e, pso_rep);
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBytes:&rp length:sizeof(rp) atIndex:1];
                 [e dispatchThreads:MTLSizeMake(REP_WIN, M, 1) threadsPerThreadgroup:MTLSizeMake(REP_WIN, 1, 1)];
                 bar(e);
             }
             if (want_top64) {
-                [e setComputePipelineState:pso_topk64];
+                set_pso(e, pso_topk64);
                 [e setBuffer:b_logits offset:0 atIndex:0];
                 [e setBuffer:b_top64_ids offset:0 atIndex:1];
                 [e setBuffer:b_top64_vals offset:0 atIndex:2];
@@ -1616,7 +1632,7 @@ struct Qwen35Engine {
                 [e setBuffer:b_top64_flag offset:0 atIndex:4];
                 [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else {
-                [e setComputePipelineState:pso_argmax];
+                set_pso(e, pso_argmax);
                 [e setBuffer:b_logits offset:0 atIndex:0]; [e setBuffer:b_out_tok offset:0 atIndex:1];
                 [e setBytes:&vocab length:sizeof(vocab) atIndex:2];
                 [e dispatchThreadgroups:MTLSizeMake(HM, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1624,6 +1640,7 @@ struct Qwen35Engine {
         }
 
         [e endEncoding];
+        last_enc_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_enc0).count();
         [cb commit];
         [cb waitUntilCompleted];
         if (gpu_ms_out) *gpu_ms_out = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
@@ -1642,6 +1659,50 @@ struct Qwen35Engine {
             }
         }
         }
+    }
+
+
+    // ─── Fase 0: biaya dispatch/barrier per token decode M=1 ───
+    //   (a) step normal  (b) semua kernel kosong, grid & barrier sama  (c) seperti (b) tanpa barrier
+    //   (d) waktu encode CPU per step. b = batas ATAS overhead GPU (di (a) sebagian bisa tumpang-tindih dengan kerja).
+    void bench_overhead(int n) {
+        if (!pso_null) { printf("▸ Overhead: null_kernel tidak tersedia\n"); return; }
+        n = std::max(8, std::min(n, max_seq - 8));
+        const RepRowsParams rp{};
+        struct R { double wall = 0, gpu = 0, enc = 0; };
+        long nd = 0, nb = 0;
+        {   int32_t t = 9707; reset_states();
+            const long d0 = n_disp, b0 = n_bar;
+            run_step_m(&t, 1, 0, &t, true, rp);
+            nd = n_disp - d0; nb = n_bar - b0; }
+        auto run = [&](int mode) {
+            R r; int32_t tok = 9707;
+            ovh_mode = mode;
+            for (int i = 0; i < 4; ++i) run_step_m(&tok, 1, i, &tok, true, rp);   // pemanasan
+            reset_states(); tok = 9707;
+            for (int i = 0; i < n; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                run_step_m(&tok, 1, i, &tok, true, rp);
+                r.wall += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                r.gpu += last_gpu_ms; r.enc += last_enc_ms;
+                if (mode) tok = 9707;          // kernel kosong tidak menulis token
+            }
+            ovh_mode = 0; reset_states();
+            r.wall /= n; r.gpu /= n; r.enc /= n;
+            return r;
+        };
+        const R a = run(0), b = run(1), c = run(2);
+        if (is_moe) printf("▸ Overhead/token [kelas: qwen35 MoE, E=%d topK=%d] (decode M=1, %d tok): %ld dispatch, %ld barrier per step\n", num_experts, top_k, n, nd, nb);
+        else        printf("▸ Overhead/token [kelas: qwen35 dense] (decode M=1, %d tok): %ld dispatch, %ld barrier per step\n", n, nd, nb);
+        printf("   (a) normal        : GPU %.3f ms | encode CPU %.3f ms | total %.3f ms\n", a.gpu, a.enc, a.wall);
+        printf("   (b) kernel kosong : GPU %.3f ms -> %.2f us/dispatch (termasuk barrier) | total %.3f ms\n",
+               b.gpu, nd ? 1e3 * b.gpu / double(nd) : 0.0, b.wall);
+        printf("   (c) tanpa barrier : GPU %.3f ms -> barrier ~ %.2f us/buah, dispatch ~ %.2f us/buah\n",
+               c.gpu, nb ? 1e3 * (b.gpu - c.gpu) / double(nb) : 0.0, nd ? 1e3 * c.gpu / double(nd) : 0.0);
+        printf("   (d) encode CPU    : %.3f ms/token = %.0f%% dari total | celah total-GPU %.3f ms\n",
+               a.enc, a.wall > 0 ? 100.0 * a.enc / a.wall : 0.0, a.wall - a.gpu);
+        printf("   => kerja nyata ~ a-b = %.3f ms | overhead GPU (b) = %.0f%% dari GPU normal\n",
+               a.gpu - b.gpu, a.gpu > 0 ? 100.0 * b.gpu / a.gpu : 0.0);
     }
 
     // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
@@ -2064,6 +2125,10 @@ int main(int argc, char** argv) {
                 printf("▸ Waktu/token: total %.2f ms | GPU %.2f ms | CPU+sinkron %.2f ms (%.0f%%) | ideal-bandwidth %.2f ms\n",
                        wall_tok, gpu_tok, wall_tok - gpu_tok, 100.0 * (wall_tok - gpu_tok) / wall_tok,
                        gbs > 0 ? mb_tok / gbs : 0.0);
+            }
+
+            if (const char* ov = getenv("BIHABA_BENCH_OVERHEAD")) {   // Fase 0 (opt-in): biaya dispatch/barrier
+                if (atoi(ov) > 0) eng.bench_overhead(std::max(64, bench_toks / 2));
             }
 
             {   // Decode di konteks panjang: attention lama vs split-sequence (hasil greedy harus identik)

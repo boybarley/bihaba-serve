@@ -2198,3 +2198,6 @@ kernel void NAME(device const float* pml [[buffer(0)]], device const float* po [
 { attn_merge_impl<HD, GATED>(pml, po, gate, out, p, tg, lane); }
 DECL_ATTN_SPLIT(attn_split_256, 256)
 DECL_ATTN_MERGE(attn_merge_256_gated, 256, true)
+
+// Fase 0: kernel kosong untuk mengukur biaya dispatch/barrier murni (dipakai hanya oleh bench_overhead)
+kernel void null_kernel() {}
