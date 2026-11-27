@@ -1913,6 +1913,45 @@ struct Qwen35Engine {
             }
             qmv4f_mode = saved;
         }
+
+        // 1.7.0.dev9: apakah bobot hasil mmap (newBufferWithBytesNoCopy) lebih lambat dibaca GPU daripada
+        // buffer Metal biasa? Salin tensor ke buffer Private / Shared baru lalu ukur kernel yang SAMA.
+        {
+            auto clone = [&](const QTensor& q, MTLResourceOptions opt) {
+                QTensor c = q;
+                const size_t wb = size_t(q.N) * size_t(q.K) * size_t(q.bits) / 8;
+                const size_t sb = size_t(q.N) * size_t(q.K >> q.gs_shift) * 2;
+                id<MTLBuffer> W = [dev newBufferWithLength:wb options:opt];
+                id<MTLBuffer> S = [dev newBufferWithLength:sb options:opt];
+                id<MTLBuffer> B = [dev newBufferWithLength:sb options:opt];
+                if (!W || !S || !B) return c;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                [bl copyFromBuffer:q.w_buf sourceOffset:q.w toBuffer:W destinationOffset:0 size:wb];
+                [bl copyFromBuffer:q.s_buf sourceOffset:q.s toBuffer:S destinationOffset:0 size:sb];
+                [bl copyFromBuffer:q.b_buf sourceOffset:q.b toBuffer:B destinationOffset:0 size:sb];
+                [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                c.w_buf = W; c.w = 0; c.s_buf = S; c.s = 0; c.b_buf = B; c.b = 0;
+                return c;
+            };
+            printf("   -- bobot disalin ke buffer Metal baru (kernel sama, qmv_4b):\n");
+            for (int pv = 0; pv < 2; ++pv) {
+                const MTLResourceOptions opt = pv == 0 ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared;
+                const char* tag = pv == 0 ? "private" : "shared";
+                QTensor lh = clone(lm_head, opt);
+                char nm[48];
+                snprintf(nm, sizeof(nm), "lm_head (%s)", tag);
+                rep(nm, lh, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lh, b_logits, false); }));
+                if (ld >= 0) {
+                    QTensor dn = clone(layers[size_t(ld)].down, opt);
+                    snprintf(nm, sizeof(nm), "ffn down (%s)", tag);
+                    rep(nm, dn, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, dn, b_x, false); }));
+                    QTensor g = clone(layers[size_t(ld)].gate, opt), u = clone(layers[size_t(ld)].up, opt);
+                    snprintf(nm, sizeof(nm), "ffn gate+up (%s)", tag);
+                    rep(nm, g, &u, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, g, u, b_dense_h); }));
+                }
+            }
+        }
         reset_states();
     }
 

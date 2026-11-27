@@ -394,3 +394,11 @@ dengan evaluasi asinkron).
 `BIHABA_QMV4F` = 0 mati (default), 1 lm_head saja, 2 semua qmv 4-bit M=1. Tidak bit-identik (kebijakan B).
 Microbench (`BIHABA_BENCH_KERNELS=1`) menampilkan waktu per tensor, selisih logit lm_head + argmax,
 dan decode A/B 128 token (identik berapa token) untuk memutuskan default.
+
+### 12.7 Hasil 1.7.0.dev8: `qmv_4b_f` (pola MLX) TIDAK lebih cepat di engine kita
+lm_head 2010 → 2087 µs, down 110 → 112 µs, decode 52.3 → 51.8 tok/s (greedy tetap identik 128/128,
+selisih logit maks 0.0078). Default tetap mati. Jadi keunggulan MLX di lm_head bukan dari bentuk kernelnya.
+Hipotesis baru (1.7.0.dev9): bobot kita dipetakan zero-copy dari file (mmap + newBufferWithBytesNoCopy),
+MLX memuat ke buffer Metal miliknya; `bw_probe` pada buffer Private baru = 322–327 GB/s ≈ lm_head MLX 328 GB/s,
+sedangkan kernel kita di atas mmap mentok ±285 GB/s. Microbench kini menyalin tensor ke buffer Private/Shared
+baru dan mengukur kernel yang sama.
