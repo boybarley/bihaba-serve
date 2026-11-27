@@ -300,3 +300,35 @@ celah sinkron total−GPU adalah GPU menganggur → target pipelining. Kerugian 
 - (f) `ovh_mode 4`: satu kelompok kernel dikosongkan per run. a − f = biaya kelompok itu.
   Kelompok dari nama fungsi Metal (dicatat di `make_pso`); lm_head dipisah lewat `cur_head`.
 - Jalur produksi: `set_pso` langsung `setComputePipelineState` bila `ovh_mode == 0` (tanpa lookup).
+
+### 10.3 Hasil Fase 0b (biaya barrier nyata a−e; atribusi f)
+
+| Kelas | a−e (barrier + drain) | per barrier | terbesar di (f) |
+|---|---|---|---|
+| transformer 0.3B | 1.40 ms (59%) | 6.2 µs | proyeksi 28%, ffn 25%, rope 8%, lm_head 2% |
+| transformer 1.7B | 1.58 ms (23%) | 7.0 µs | proyeksi 34%, ffn 35%, lm_head 11% |
+| qwen35 dense | 2.63 ms (12%) | 10.2 µs | proyeksi 41%, ffn 42%, lm_head 9% |
+| qwen35 MoE topK=4 | 3.35 ms (35%) | 7.6 µs | proyeksi 35%, expert 19%, lm_head 10%, deltanet 8% |
+
+Config: 0.3B vocab 65536 (tied); MoE `num_experts_per_tok` bawaan = **8** (bench/acuan memakai 4 = mode cepat).
+Pipelining N=1 bernilai kecil di chat nyata: draft n-gram step t+1 bergantung token t (CPU).
+
+### 10.4 HASIL NEGATIF: fusi RMSNorm ke prolog proyeksi (dicoba, dibuang)
+
+Kernel `qmv_*_rn`/`dense_swiglu_*_rn`: tiap threadgroup menghitung ulang RMSNorm dengan urutan reduksi identik
+`rms_norm` → **bit-identik** (greedy 128/128, jawaban chat identik). Tetapi lebih lambat: 0.3B QKV +2% (noise),
+FFN −3%; 1.7B QKV −3%, FFN −7%, keduanya −10% (`uji_semua` GAGAL). Sebab: prolog redundan di setiap threadgroup
+(±1.500 TG gate/up per layer di 1.7B) lebih mahal dari barrier yang dihapus. Norm sekali tanpa dispatch terpisah
+butuh atomik lintas TG → urutan tidak tetap → tidak bit-identik. Jangan dicoba ulang dalam bentuk ini.
+
+## 11. 1.7.0.dev3: checkpoint per pesan (engine qwen35, dense + MoE)
+
+- Default qwen35 kembali **kanonik** (`SESSION_CACHE_BY_ENGINE["qwen35"] = False`) → jawaban = acuan.
+  `--session-cache` tetap memaksa sesi token-persis (TTFT ~0.3 s, tidak kanonik).
+- Python mengirim `ckpt_at` = posisi tepat setelah header asisten terakhir (`<|im_start|>assistant\n`).
+- Engine mengambil checkpoint (DeltaNet + KV s/d pos) di titik grid chunk g ≤ ckpt_at, dengan grid = kelipatan
+  `prefill_chunk` dari awal segmen jalur penuh (prefix_len atau 0). Restore di g + prefill sisa memakai batas
+  chunk yang sama dengan prefill penuh → **identik secara konstruksi** dengan jalur kanonik tanpa checkpoint.
+- Pemilihan: live (bila seluruh cache prefix) ≥ checkpoint terpanjang > snapshot bake > reset.
+- LRU di RAM, `BIHABA_CKPT_MB` (default 2048, 0 = mati); `clear_state` mengosongkan semua.
+  Stats `done`: `ckpt` (posisi restore), `ckpts`, `ckpt_mb`. Engine transformer TIDAK diubah.

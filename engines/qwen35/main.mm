@@ -452,6 +452,31 @@ struct Qwen35Engine {
     std::vector<int32_t> cached_ids;
     StateSnapshot ram_snap;
 
+    // ─── 1.7.0.dev3: checkpoint per pesan (LRU di RAM, env BIHABA_CKPT_MB, 0 = mati) ───
+    // Diambil di titik grid chunk ≤ awal jawaban asisten (ckpt_at dari Python). Grid = kelipatan chunk dari
+    // awal segmen prefill jalur penuh (prefix_len atau 0) → restore + prefill sisa = batas chunk yang sama
+    // dengan prefill penuh → hasil identik dengan jalur kanonik tanpa checkpoint.
+    std::vector<StateSnapshot> ckpts;
+    std::vector<uint64_t> ckpt_used;
+    uint64_t ckpt_clock = 0;
+    size_t ckpt_budget = size_t(2048) << 20;
+    int pending_ckpt_at = -1;           // diisi per request, dipakai sekali oleh prefill_incremental
+    int last_ckpt_hit = 0;
+    size_t ckpt_bytes() const { size_t s = 0; for (const auto& c : ckpts) s += c.bytes(); return s; }
+    void ckpt_clear() { ckpts.clear(); ckpt_used.clear(); }
+    void ckpt_add(StateSnapshot&& s) {
+        for (size_t i = 0; i < ckpts.size(); ++i)
+            if (ckpts[i].ids == s.ids) { ckpt_used[i] = ++ckpt_clock; return; }
+        const size_t need = s.bytes();
+        if (need == 0 || need > ckpt_budget) return;
+        while (!ckpts.empty() && ckpt_bytes() + need > ckpt_budget) {
+            size_t lru = 0;
+            for (size_t i = 1; i < ckpts.size(); ++i) if (ckpt_used[i] < ckpt_used[lru]) lru = i;
+            ckpts.erase(ckpts.begin() + long(lru)); ckpt_used.erase(ckpt_used.begin() + long(lru));
+        }
+        ckpts.push_back(std::move(s)); ckpt_used.push_back(++ckpt_clock);
+    }
+
     bool is_eos(int32_t t) const {
         for (int32_t e : eos_ids) if (t == e) return true;
         return false;
@@ -993,6 +1018,7 @@ struct Qwen35Engine {
         pso_bw            = make_pso(dev, lib, "bw_probe",                false, bf);
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
+        if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_dn_in4        = make_pso(dev, lib, "deltanet_in_proj_4b",     false, bf);
@@ -1778,7 +1804,7 @@ struct Qwen35Engine {
     //   Auto-captures `ram_snap` at `prefix_len` whenever a new shared system prompt is seen!
     void prefill_range(const std::vector<int32_t>& pids, size_t start, size_t end, int& pos,
                        bool run_last_head, bool want_top64, int32_t* last_out_id,
-                       int32_t* last_top64_ids, float* last_top64_vals) {
+                       int32_t* last_top64_ids, float* last_top64_vals, int cap_at = -1) {
         const RepRowsParams no_rp{};
         const int chunk_max = std::max(1, std::min(prefill_chunk, int(MAX_P)));
         int32_t out_id = 0;
@@ -1787,6 +1813,12 @@ struct Qwen35Engine {
         for (size_t i = start; i < end; i += size_t(chunk_max)) {
             const int chunk = int(std::min<size_t>(size_t(chunk_max), end - i));
             const bool is_last = run_last_head && (i + size_t(chunk) == end);
+            if (cap_at >= 0 && pos == cap_at) {   // checkpoint per pesan: salin state SEBELUM chunk ini
+                StateSnapshot s;
+                capture_snapshot(s, std::vector<int32_t>(pids.begin(), pids.begin() + cap_at), pos);
+                ckpt_add(std::move(s));
+                cap_at = -1;
+            }
             run_step_m(pids.data() + i, chunk, pos, &out_id, is_last, no_rp, nullptr,
                        is_last && want_top64, t64_i, t64_v, /*prefill=*/true, /*head_last_only=*/true);
             for (int c = 0; c < chunk; ++c) cached_ids.push_back(pids[i + size_t(c)]);
@@ -1815,10 +1847,27 @@ struct Qwen35Engine {
         }
         bool hit_snap = (ram_snap.valid() && lcp_snap == ram_snap.ids.size() && lcp_snap > 0 && lcp_snap < pids.size());
 
+        // Level 3: checkpoint per pesan — terpanjang yang id-nya prefix dari prompt baru
+        const int ck_at = pending_ckpt_at; pending_ckpt_at = -1;
+        last_ckpt_hit = 0;
+        int best_c = -1; size_t lcp_ck = 0;
+        for (size_t c = 0; c < ckpts.size(); ++c) {
+            const auto& s = ckpts[c];
+            if (s.ids.size() >= pids.size() || s.ids.size() <= lcp_ck) continue;
+            if (std::equal(s.ids.begin(), s.ids.end(), pids.begin())) { best_c = int(c); lcp_ck = s.ids.size(); }
+        }
+        const size_t live_v = hit_live ? lcp_live : 0, snap_v = hit_snap ? lcp_snap : 0;
+
         size_t start = 0;
-        if (hit_live && (!hit_snap || lcp_live >= lcp_snap)) {
+        if (hit_live && live_v >= snap_v && live_v >= lcp_ck) {
             start = lcp_live;
             reused_out = int(lcp_live);
+        } else if (best_c >= 0 && lcp_ck > snap_v) {
+            restore_snapshot(ckpts[size_t(best_c)]);
+            ckpt_used[size_t(best_c)] = ++ckpt_clock;
+            start = lcp_ck;
+            reused_out = int(lcp_ck);
+            last_ckpt_hit = int(lcp_ck);
         } else if (hit_snap) {
             restore_snapshot(ram_snap);
             start = lcp_snap;
@@ -1840,7 +1889,17 @@ struct Qwen35Engine {
             start = size_t(prefix_len);
         }
 
-        prefill_range(pids, start, pids.size(), pos, true, want_top64, &out_tok, last_top64_ids, last_top64_vals);
+        int cap = -1;   // titik grid chunk ≤ awal jawaban asisten, dihitung dari awal segmen jalur penuh (O)
+        if (ck_at > 0 && ckpt_budget > 0) {
+            const int chunk = std::max(1, std::min(prefill_chunk, int(MAX_P)));
+            const int O = prefix_len > 0 && size_t(prefix_len) < pids.size() ? prefix_len : 0;
+            const int b = std::min(ck_at, int(pids.size()) - 1);
+            if (b > O) {
+                const int g = O + ((b - O) / chunk) * chunk;
+                if (g > O && g >= int(start) && (g - int(start)) % chunk == 0) cap = g;
+            }
+        }
+        prefill_range(pids, start, pids.size(), pos, true, want_top64, &out_tok, last_top64_ids, last_top64_vals, cap);
         pos_out = pos;
         return out_tok;
     }
@@ -2299,9 +2358,11 @@ int main(int argc, char** argv) {
                 if (cmd && [cmd isEqualToString:@"clear_state"]) {
                     // Buang snapshot prefix di RAM + cache percakapan. File .tstate di disk tidak disentuh.
                     const double freed = eng.ram_snap.bytes() / 1e6;
+                    const double freed_ck = eng.ckpt_bytes() / 1e6;
                     eng.ram_snap = StateSnapshot{};
+                    eng.ckpt_clear();
                     eng.reset_states();
-                    printf("{\"cleared\":true,\"mb\":%.1f}\n", freed);
+                    printf("{\"cleared\":true,\"mb\":%.1f}\n", freed + freed_ck);
                     fflush(stdout);
                     continue;
                 }
@@ -2369,11 +2430,13 @@ int main(int argc, char** argv) {
                 if (req[@"seed"])        sc.seed        = uint32_t([req[@"seed"] unsignedIntValue]);
 
                 g_cancel.store(false, std::memory_order_relaxed);
+                eng.pending_ckpt_at = req[@"ckpt_at"] ? [req[@"ckpt_at"] intValue] : -1;
                 SpecStats st = generate_adaptive(eng, pids, prefix_len, mt, sp_k, sc, cost, true);
                 int n_dec = std::max(0, int(st.tokens.size()) - 1);
                 double tps = (st.decode_ms > 0.0) ? (n_dec * 1000.0 / st.decode_ms) : 0.0;
-                printf("{\"done\":true,\"tokens\":%d,\"ms\":%.1f,\"prefill_ms\":%.1f,\"reused\":%d,\"baked_toks\":%d,\"tps\":%.1f,\"tok_per_step\":%.2f}\n",
-                       n_dec, st.decode_ms, st.prefill_ms, st.reused, eng.ram_snap.pos, tps, double(n_dec) / std::max(st.steps, 1));
+                printf("{\"done\":true,\"tokens\":%d,\"ms\":%.1f,\"prefill_ms\":%.1f,\"reused\":%d,\"baked_toks\":%d,\"tps\":%.1f,\"tok_per_step\":%.2f,\"ckpt\":%d,\"ckpts\":%zu,\"ckpt_mb\":%.0f}\n",
+                       n_dec, st.decode_ms, st.prefill_ms, st.reused, eng.ram_snap.pos, tps, double(n_dec) / std::max(st.steps, 1),
+                       eng.last_ckpt_hit, eng.ckpts.size(), eng.ckpt_bytes() / 1e6);
                 fflush(stdout);
             }
         }

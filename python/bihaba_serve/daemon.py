@@ -39,7 +39,9 @@ def _msg_key(messages: list[dict]) -> list[tuple[str, str]]:
 #       tiap giliran (Qwythos riwayat 6k: ±20 s vs 0.3 s). Perilaku v1.5.0 yang sudah dipakai & dinilai baik.
 #   transformer (Qwen3/Llama dense, model kecil): MATI — terbukti mengubah jawaban Bihaba-AI-1.7B (CATATAN_TEKNIS §8).
 # Paksa per server dengan --session-cache / --no-session-cache.
-SESSION_CACHE_BY_ENGINE = {"qwen35": True, "transformer": False}
+# 1.7.0.dev3: qwen35 kembali kanonik (jawaban = acuan); kecepatan giliran lanjut dari checkpoint per pesan
+# di engine. --session-cache tetap memaksa sesi token-persis (cepat, tidak kanonik).
+SESSION_CACHE_BY_ENGINE = {"qwen35": False, "transformer": False}
 
 
 class StreamDecoder:
@@ -88,6 +90,18 @@ class StopFilter:
     def flush(self) -> str:
         out, self.pending = self.pending, ""
         return out
+
+
+def ckpt_point(ids: list[int], header: list[int]) -> int | None:
+    """Posisi tepat SETELAH header asisten terakhir (<|im_start|>assistant\n): di titik ini riwayat kanonik
+    giliran berikutnya mulai berbeda (blok <think> kosong / tokenisasi ulang jawaban)."""
+    n = len(header)
+    if n == 0 or len(ids) <= n:
+        return None
+    for i in range(len(ids) - n, -1, -1):
+        if ids[i:i + n] == header:
+            return i + n
+    return None
 
 
 def find_engine_binary(engine_name: str, repo_root: Path) -> Path:
@@ -220,6 +234,7 @@ class EngineDaemon:
         rep_penalty: float | None = None,
         seed: int | None = None,
         stop: list[str] | None = None,
+        ckpt_at: int | None = None,
     ):
         # Sesuaikan max_tokens dengan sisa konteks (seperti API OpenAI): percakapan panjang tidak gagal hanya
         # karena max_tokens default terlalu besar. Gagal hanya bila prompt sendiri tidak muat.
@@ -243,6 +258,8 @@ class EngineDaemon:
         }
         if seed is not None:
             payload["seed"] = int(seed)
+        if ckpt_at is not None:
+            payload["ckpt_at"] = int(ckpt_at)
 
         stop_seqs = [s for s in (stop or []) if s]
 
@@ -329,6 +346,13 @@ class EngineDaemon:
             prompt_ids, prefix_len = hit
         else:
             prompt_ids, prefix_len = self.tok.format_chat_with_prefix(messages, enable_thinking=self.enable_thinking)
+        ck = None
+        if not hit and chatml and getattr(getattr(self, "info", None), "engine", None) == "qwen35":
+            if getattr(self, "_asst_hdr", None) is None:
+                self._asst_hdr = self.tok.encode_raw("<|im_start|>assistant\n")
+            ck = ckpt_point(prompt_ids, self._asst_hdr)
+        if ck is not None:
+            kwargs["ckpt_at"] = ck
         self._sess = None
         text: list[str] = []
         for ev in self.stream_prompt_ids(prompt_ids, prefix_len=prefix_len, **kwargs):

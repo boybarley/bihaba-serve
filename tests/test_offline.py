@@ -465,7 +465,7 @@ class TestStreaming(unittest.TestCase):
 
     def test_session_policy_per_engine(self):
         from bihaba_serve.daemon import SESSION_CACHE_BY_ENGINE
-        self.assertTrue(SESSION_CACHE_BY_ENGINE["qwen35"])        # Qwythos / MoE: cepat seperti v1.5.0
+        self.assertFalse(SESSION_CACHE_BY_ENGINE["qwen35"])       # 1.7: kanonik + checkpoint per pesan
         self.assertFalse(SESSION_CACHE_BY_ENGINE["transformer"])  # model kecil: jawaban kanonik
 
     def test_context_overflow_is_clear_error(self):
@@ -558,6 +558,16 @@ class TestAttnSplit(unittest.TestCase):
 
 
 # ─── Lint Metal: aturan yang sudah dua kali memakan korban di Mac ──────────────────────────────
+class TestCkptPoint(unittest.TestCase):
+    def test_after_last_assistant_header(self):
+        from bihaba_serve.daemon import ckpt_point
+        H = [7, 8, 9]
+        ids = [1, 2] + H + [50, 51, 3] + [4, 5] + H + [60, 61, 62]
+        self.assertEqual(ckpt_point(ids, H), len(ids) - 3)
+        self.assertIsNone(ckpt_point([1, 2, 3, 4], H))
+        self.assertIsNone(ckpt_point(H, H))
+
+
 class TestMetalLint(unittest.TestCase):
     FILES = ["engines/transformer/kernels.metal", "engines/qwen35/kernels.metal"]
 
