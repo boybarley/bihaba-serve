@@ -357,3 +357,17 @@ acuan v1.6.2 diarsipkan. Target: unggul di semua kelas.
 `BIHABA_BENCH_KERNELS=1 bihaba-serve bench --model …` (qwen35) vs `scripts/bench_mlx_kernels.py <model>`
 (lingkungan MLX): µs dan GB/s untuk ffn gate+up, ffn down, deltanet out_proj, lm_head pada tensor asli.
 Menentukan apakah celah decode 9B ada di kernel qmv atau di tempat lain.
+
+### 12.2 Hasil microbench Qwythos (M=1, tensor asli) dan 1.7.0.dev6
+
+| Tensor | bihaba | MLX 0.32.5 |
+|---|---|---|
+| ffn gate+up (N=12288, K=4096) | 277.4 µs (204 GB/s, fused) | 208.6 µs (2 × qmm, ~271 GB/s) |
+| ffn down (N=4096, K=12288) | 111.0 µs (255 GB/s) | 105.5 µs (268 GB/s) |
+| deltanet out_proj (4096×4096) | 40.8 µs (231 GB/s) | 46.8 µs (201 GB/s) |
+| lm_head (248320×4096) | 1985.6 µs (288 GB/s) | 1745.0 µs (328 GB/s) |
+
+Celah terbesar: SwiGLU M=1 (−33%). Dugaan: kernel generik `dense_swiglu_m_impl` memakai `float ag[8], au[8]`
+yang diindeks `m` runtime (pelajaran lama: array akumulator → spill). 1.7.0.dev6 menambah `dense_swiglu_{b}b_m1`
+(akumulator skalar; loop, ekspresi, dan simd_sum sama → diharapkan bit-identik) untuk M=1 di kedua engine.
+`BIHABA_SW1=0` → kernel lama. Microbench menampilkan lama vs m1.

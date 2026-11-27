@@ -553,6 +553,122 @@ DECL_SWIG_M(dense_swiglu_4b, 4)
 DECL_SWIG_M(dense_swiglu_6b, 6)
 DECL_SWIG_M(dense_swiglu_8b, 8)
 
+// ─── 1.7.0.dev6: SwiGLU decode M=1 dengan akumulator skalar (array ag[8]/au[8] ber-indeks runtime
+// di kernel generik membuat gate+up 9B hanya ~204 GB/s vs MLX ~270 GB/s). Loop & ekspresi sama. ───
+template <int BITS>
+inline void dense_swiglu_m1_impl(
+    device const half* x,
+    device const uint32_t* wg, device const ushort* sg_a, device const ushort* bg_a,
+    device const uint32_t* wu, device const ushort* su_a, device const ushort* bu_a,
+    device half* out, constant QMVMultiParams& p, uint tg_x, uint sg, uint lane)
+{
+    const int K = p.K, N = p.N, gsh = p.gs_shift;
+    const int row = int(tg_x) * 4 + int(sg);
+    if (row >= N) return;
+    const ulong kg = ulong(K >> gsh), so = ulong(row) * kg;
+    float ag0 = 0.0f, au0 = 0.0f;
+
+    if (BITS == 4) {
+        const ulong wo = ulong(row) * ulong(K >> 3);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 3, g = gk >> gsh;
+            const uint32_t ga = wg[wo+wi], gb = wg[wo+wi+1], ua = wu[wo+wi], ub = wu[wo+wi+1];
+            const half2 hsg = half2(load_sb_h(sg_a, so+g)), hbg = half2(load_sb_h(bg_a, so+g));
+            const half2 hsu = half2(load_sb_h(su_a, so+g)), hbu = half2(load_sb_h(bu_a, so+g));
+            {
+                const device half4* xp = (const device half4*)(x + gk);
+                ag0 += dot_4bit_word(ga, hsg, hbg, xp) + dot_4bit_word(gb, hsg, hbg, xp + 2);
+                au0 += dot_4bit_word(ua, hsu, hbu, xp) + dot_4bit_word(ub, hsu, hbu, xp + 2);
+            }
+        }
+    } else if (BITS == 6) {
+        const ulong wo = ulong(row) * ulong((K * 6) >> 5);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int blk = (gk >> 4) * 3, g = gk >> gsh;
+            const uint32_t g0 = wg[wo+blk], g1 = wg[wo+blk+1], g2 = wg[wo+blk+2];
+            const uint32_t u0 = wu[wo+blk], u1 = wu[wo+blk+1], u2 = wu[wo+blk+2];
+            const float sgv = load_sb_f(sg_a, so+g), bgv = load_sb_f(bg_a, so+g);
+            const float suv = load_sb_f(su_a, so+g), buv = load_sb_f(bu_a, so+g);
+            {
+                const device half4* xp = (const device half4*)(x + gk);
+                ag0 += dot_6bit_block16(g0, g1, g2, sgv, bgv, xp);
+                au0 += dot_6bit_block16(u0, u1, u2, suv, buv, xp);
+            }
+        }
+    } else if (BITS == 3) {
+        const ulong wo = ulong(row) * ulong((K * 3) >> 5);
+        for (int k0 = 0; k0 < K; k0 += 1024) {
+            const int gk = k0 + int(lane) * 32;
+            if (gk >= K) break;
+            const int blk = (gk >> 5) * 3, g = gk >> gsh;
+            const uint32_t g0 = wg[wo+blk], g1 = wg[wo+blk+1], g2 = wg[wo+blk+2];
+            const uint32_t u0 = wu[wo+blk], u1 = wu[wo+blk+1], u2 = wu[wo+blk+2];
+            const float sgv = load_sb_f(sg_a, so+g), bgv = load_sb_f(bg_a, so+g);
+            const float suv = load_sb_f(su_a, so+g), buv = load_sb_f(bu_a, so+g);
+            {
+                const device half4* xp = (const device half4*)(x + gk);
+                ag0 += dot_3bit_block32(g0, g1, g2, sgv, bgv, xp);
+                au0 += dot_3bit_block32(u0, u1, u2, suv, buv, xp);
+            }
+        }
+    } else if (BITS == 2) {
+        const ulong wo = ulong(row) * ulong(K >> 4);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int kwi = gk >> 4, g = gk >> gsh;
+            const uint32_t wgv = wg[wo + kwi], wuv = wu[wo + kwi];
+            const half2 hsg = half2(load_sb_h(sg_a, so+g)), hbg = half2(load_sb_h(bg_a, so+g));
+            const half2 hsu = half2(load_sb_h(su_a, so+g)), hbu = half2(load_sb_h(bu_a, so+g));
+            {
+                const device half4* xp = (const device half4*)(x + gk);
+                ag0 += dot_2bit_word(wgv, hsg, hbg, xp);
+                au0 += dot_2bit_word(wuv, hsu, hbu, xp);
+            }
+        }
+    } else {
+        const ulong wo = ulong(row) * ulong(K >> 2);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 2, g = gk >> gsh;
+            const uint32_t g0 = wg[wo+wi], g1 = wg[wo+wi+1], g2 = wg[wo+wi+2], g3 = wg[wo+wi+3];
+            const uint32_t u0 = wu[wo+wi], u1 = wu[wo+wi+1], u2 = wu[wo+wi+2], u3 = wu[wo+wi+3];
+            const float sgv = load_sb_f(sg_a, so+g), bgv = load_sb_f(bg_a, so+g);
+            const float suv = load_sb_f(su_a, so+g), buv = load_sb_f(bu_a, so+g);
+            {
+                const device half4* xp = (const device half4*)(x + gk);
+                ag0 += dot_8bit_word(g0, sgv, bgv, xp[0]) + dot_8bit_word(g1, sgv, bgv, xp[1])
+                       + dot_8bit_word(g2, sgv, bgv, xp[2]) + dot_8bit_word(g3, sgv, bgv, xp[3]);
+                au0 += dot_8bit_word(u0, suv, buv, xp[0]) + dot_8bit_word(u1, suv, buv, xp[1])
+                       + dot_8bit_word(u2, suv, buv, xp[2]) + dot_8bit_word(u3, suv, buv, xp[3]);
+            }
+        }
+    }
+    {
+        const float gv = simd_sum(ag0), uv = simd_sum(au0);
+        if (lane == 0) out[row] = half((gv / (1.0f + exp(-gv))) * uv);
+    }
+}
+
+#define DECL_SWIG_M1(NAME, BITS) \
+kernel void NAME(device const half* x [[buffer(0)]], \
+    device const uint32_t* wg [[buffer(1)]], device const ushort* sg_a [[buffer(2)]], device const ushort* bg_a [[buffer(3)]], \
+    device const uint32_t* wu [[buffer(4)]], device const ushort* su_a [[buffer(5)]], device const ushort* bu_a [[buffer(6)]], \
+    device half* out [[buffer(7)]], constant QMVMultiParams& p [[buffer(8)]], \
+    uint tg_x [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ dense_swiglu_m1_impl<BITS>(x, wg, sg_a, bg_a, wu, su_a, bu_a, out, p, tg_x, sg, lane); }
+
+DECL_SWIG_M1(dense_swiglu_2b_m1, 2)
+DECL_SWIG_M1(dense_swiglu_3b_m1, 3)
+DECL_SWIG_M1(dense_swiglu_4b_m1, 4)
+DECL_SWIG_M1(dense_swiglu_6b_m1, 6)
+DECL_SWIG_M1(dense_swiglu_8b_m1, 8)
+
 // ─────────────────────── 4D. BM=8·MT, BN=32, BK=64 Compact-Half Hardware MMA ───────────────────────
 // MT = jumlah tile 8-token. MT=1: verifikasi spekulatif M=4..8. MT=4: prefill M=9..32.
 // Tile bobot (32 baris × 64 K) di-dekuantisasi SEKALI ke threadgroup memory lalu dipakai untuk semua

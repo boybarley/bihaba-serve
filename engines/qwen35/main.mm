@@ -424,6 +424,8 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_conv1d_prefill=nil, pso_dn_prefill=nil;
     id<MTLComputePipelineState> pso_qmv1[9], pso_qmv1_add[9];
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
+    id<MTLComputePipelineState> pso_sw1[9] = {nil};   // 1.7.0.dev6: SwiGLU M=1 skalar (env BIHABA_SW1=0 → kernel lama)
+    bool use_sw1 = true;
     id<MTLComputePipelineState> pso_dn_in4=nil, pso_dn_in4_m1=nil, pso_dn_in4_mma8=nil;
     id<MTLComputePipelineState> pso_full_qkv4=nil, pso_full_qkv4_m1=nil, pso_full_qkv4_mma8=nil;
     id<MTLComputePipelineState> pso_qmm4_mma8=nil, pso_qmm4_mma8_add=nil, pso_qmm2_mma8=nil, pso_qmm2_mma8_add=nil;
@@ -1019,6 +1021,7 @@ struct Qwen35Engine {
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
+        if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_dn_in4        = make_pso(dev, lib, "deltanet_in_proj_4b",     false, bf);
@@ -1068,6 +1071,7 @@ struct Qwen35Engine {
             pso_qmvm[b]     = make_pso(dev, lib, qmvm_n[i], false, bf);
             pso_qmvm_add[b] = make_pso(dev, lib, qmvm_n[i], true,  bf);
             pso_sw[b]       = make_pso(dev, lib, sw_n[i],   false, bf);
+            pso_sw1[b]      = make_pso(dev, lib, (std::string(sw_n[i]) + "_m1").c_str(), false, bf);
         }
         pso_moe_sw1[2] = make_pso(dev, lib, "moe_swiglu_2b",     false, bf);
         pso_moe_sw1[3] = make_pso(dev, lib, "moe_swiglu_3b",     false, bf);
@@ -1387,7 +1391,7 @@ struct Qwen35Engine {
         const bool use_mma = (M >= mma_min_m(gp.bits) && mma_ok);
         id<MTLComputePipelineState> pso = use_mma
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
-            : pso_sw[gp.bits];
+            : ((M == 1 && use_sw1 && pso_sw1[gp.bits]) ? pso_sw1[gp.bits] : pso_sw[gp.bits]);
         const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
         set_pso(e, pso);
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
@@ -1809,7 +1813,12 @@ struct Qwen35Engine {
         printf("▸ Kernel microbench bihaba (M=1, R=%d, barrier di antara, waktu GPU):\n", R);
         if (ld >= 0) {
             const auto& L = layers[size_t(ld)];
-            rep("ffn gate+up", L.gate, &L.up, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, L.gate, L.up, b_dense_h); }));
+            const bool sw_saved = use_sw1;
+            use_sw1 = false;
+            rep("ffn gate+up (lama)", L.gate, &L.up, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, L.gate, L.up, b_dense_h); }));
+            use_sw1 = true;
+            rep("ffn gate+up (m1)", L.gate, &L.up, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, L.gate, L.up, b_dense_h); }));
+            use_sw1 = sw_saved;
             rep("ffn down", L.down, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, L.down, b_x, false); }));
         }
         if (la >= 0) {

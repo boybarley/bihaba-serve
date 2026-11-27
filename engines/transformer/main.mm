@@ -373,6 +373,8 @@ struct TransformerEngine {
     id<MTLComputePipelineState> pso_embed=nil, pso_rms=nil, pso_rep=nil, pso_argmax=nil, pso_topk64=nil;
     id<MTLComputePipelineState> pso_qmv1[9], pso_qmv1_add[9];
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
+    id<MTLComputePipelineState> pso_sw1[9] = {nil};   // 1.7.0.dev6: SwiGLU M=1 skalar (env BIHABA_SW1=0 → kernel lama)
+    bool use_sw1 = true;
     id<MTLComputePipelineState> pso_qmm4_mma8=nil, pso_qmm4_mma8_add=nil, pso_qmm2_mma8=nil, pso_qmm2_mma8_add=nil;
     id<MTLComputePipelineState> pso_sw4_mma8=nil, pso_sw2_mma8=nil;
     // MMA generik per bit-width: [bits][0=mma8,1=mmaP][add_res] dan swiglu [bits][mma8/mmaP]. nil = tidak ada.
@@ -724,6 +726,7 @@ struct TransformerEngine {
             pso_attn_split = make_pso(dev, lib, sn, false, bf);
             pso_attn_merge = make_pso(dev, lib, mn, false, bf);
         }
+        if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_qmm4_mma8     = make_pso(dev, lib, "qmm_4b_mma8",             false, bf);
@@ -757,6 +760,7 @@ struct TransformerEngine {
             pso_qmvm[b]     = make_pso(dev, lib, qm_n[i], false, bf);
             pso_qmvm_add[b] = make_pso(dev, lib, qm_n[i], true,  bf);
             pso_sw[b]       = make_pso(dev, lib, sw_n[i], false, bf);
+            pso_sw1[b]      = make_pso(dev, lib, (std::string(sw_n[i]) + "_m1").c_str(), false, bf);
         }
 
         auto mkbuf = [&](size_t bytes) -> id<MTLBuffer> {
@@ -927,7 +931,7 @@ struct TransformerEngine {
         const bool use_mma = (M >= mma_min_m(gp.bits) && mma_ok);
         id<MTLComputePipelineState> pso = use_mma
             ? pso_swm[gp.bits][M > MAX_M ? 1 : 0]
-            : pso_sw[gp.bits];
+            : ((M == 1 && use_sw1 && pso_sw1[gp.bits]) ? pso_sw1[gp.bits] : pso_sw[gp.bits]);
         const int rows_per_tg = use_mma ? (M > MAX_M ? 64 : 32) : 4;
         set_pso(e, pso);
         [e setBuffer:inp offset:NSUInteger(row0) * NSUInteger(gp.K) * 2 atIndex:0];
