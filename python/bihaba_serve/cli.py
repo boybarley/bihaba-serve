@@ -111,9 +111,9 @@ def main() -> None:
     p_srv.add_argument("--cors", default=None, help="Aktifkan CORS untuk origin ini, mis. '*' atau 'http://localhost:3000'")
     p_srv.add_argument("--state-dir", default=None, help="Folder tempat POST /v1/state/bake boleh menyimpan .tstate")
     p_srv.add_argument("--session-cache", action="store_true",
-                       help="EKSPERIMEN: pakai ulang id token persis antar-giliran (TTFT jauh lebih cepat), tetapi riwayat "
-                            "menyimpang dari template kanonik dan jawaban model bisa berubah. Default mati.")
-    p_srv.add_argument("--no-session-cache", action="store_true", help=argparse.SUPPRESS)   # kompatibilitas v1.5.0
+                       help="Paksa cache sesi AKTIF untuk semua model (default: aktif untuk Qwen3.5/MoE, mati untuk model transformer)")
+    p_srv.add_argument("--no-session-cache", action="store_true",
+                       help="Paksa cache sesi MATI untuk semua model (riwayat selalu dirender sesuai template kanonik)")
 
     p_chat = sub.add_parser("chat", help="Interactive terminal chat")
     p_chat.add_argument("--model", required=True)
@@ -212,7 +212,7 @@ def main() -> None:
             rep_penalty=args.rep_penalty, enable_thinking=args.thinking,
             top_k_moe=args.top_k, max_spec=args.spec, max_seq=args.max_seq,
             load_state=args.load_state, default_temp=args.temp, prefill_chunk=args.prefill_chunk,
-            session_cache=args.session_cache and not args.no_session_cache,
+            session_cache=(False if args.no_session_cache else (True if args.session_cache else None)),
         )
         if sys_text and not args.load_state and pool.active:
             res = pool.active.bake_system_prompt(sys_text, None)

@@ -34,6 +34,14 @@ def _msg_key(messages: list[dict]) -> list[tuple[str, str]]:
     return out
 
 
+# Kebijakan per kelas model (bukan satu setelan untuk semua):
+#   qwen35 (Qwen3.5 dense & MoE): AKTIF — DeltaNet tidak bisa mundur, tanpa cache sesi seluruh riwayat diproses ulang
+#       tiap giliran (Qwythos riwayat 6k: ±20 s vs 0.3 s). Perilaku v1.5.0 yang sudah dipakai & dinilai baik.
+#   transformer (Qwen3/Llama dense, model kecil): MATI — terbukti mengubah jawaban Bihaba-AI-1.7B (CATATAN_TEKNIS §8).
+# Paksa per server dengan --session-cache / --no-session-cache.
+SESSION_CACHE_BY_ENGINE = {"qwen35": True, "transformer": False}
+
+
 class StreamDecoder:
     """Detokenizer inkremental: O(panjang token baru), bukan decode ulang seluruh jawaban tiap token.
     Menahan potongan UTF-8 yang belum lengkap (karakter pengganti di ujung)."""
@@ -109,10 +117,10 @@ class EngineDaemon:
         load_state: str | None = None,
         default_temp: float = 0.0,
         prefill_chunk: int = 128,
-        session_cache: bool = False,   # MATI default: riwayat versi sesi tidak kanonik → jawaban model bisa berubah (lihat CATATAN_TEKNIS §8)
+        session_cache: bool | None = None,   # None = ikut kebijakan kelas model (SESSION_CACHE_BY_ENGINE)
     ):
         self.info = model_info
-        self.session_cache = session_cache
+        self.session_cache = SESSION_CACHE_BY_ENGINE.get(model_info.engine, False) if session_cache is None else session_cache
         self._sess: dict | None = None
         self.enable_thinking = enable_thinking
         self.default_temp = default_temp

@@ -463,6 +463,11 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual((out, hit), ("a#b", False))
         self.assertEqual(g.flush(), "#")
 
+    def test_session_policy_per_engine(self):
+        from bihaba_serve.daemon import SESSION_CACHE_BY_ENGINE
+        self.assertTrue(SESSION_CACHE_BY_ENGINE["qwen35"])        # Qwythos / MoE: cepat seperti v1.5.0
+        self.assertFalse(SESSION_CACHE_BY_ENGINE["transformer"])  # model kecil: jawaban kanonik
+
     def test_context_overflow_is_clear_error(self):
         d = object.__new__(EngineDaemon)
         d.max_seq, d.default_temp, d.default_rep_pen = 32, 0.0, 1.0
