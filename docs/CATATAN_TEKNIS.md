@@ -339,3 +339,21 @@ Qwythos-9B, Web Console, jalur kanonik + checkpoint: `reuse 512`, prefill 4.63 s
 Checkpoint bekerja dan identik dengan acuan, tetapi jalur kanonik wajib mem-prefill ulang jawaban lama → jauh lebih
 lambat dari sesi token-persis (~0.3 s). Keputusan: qwen35 kembali ke sesi token-persis sebagai default; checkpoint
 tetap aktif sebagai cadangan jalur kanonik (sesi meleset, riwayat diedit, klien API, `regress_chat`/`uji_semua`).
+
+## 12. Adu langsung dengan mlx-lm 0.32.2 (M1 Max yang sama, 2026-11-28)
+
+| Kelas | Prefill bihaba / MLX | Decode bihaba / MLX |
+|---|---|---|
+| 1.7B | 1143 / 754 | 133 / 128 |
+| Qwythos 9B | 276 / 184 | 46 / 55.4 |
+| MoE top-k 8 (bawaan) | 289 / 433 | 86.9 / 70.1 |
+
+(prompt MLX 570–1009 token, bihaba 512; decode MLX setelah prompt.) Celah: decode 9B (−17%) dan prefill MoE (−33%).
+Kebijakan baru (disetujui pemilik): kernel baru boleh tidak bit-identik bila (1) tidak ada angka turun,
+(2) selisih logit kecil (dicek otomatis), (3) jawaban chat diperiksa manual; lalu acuan baru disimpan,
+acuan v1.6.2 diarsipkan. Target: unggul di semua kelas.
+
+### 12.1 1.7.0.dev5: microbench kernel per tensor
+`BIHABA_BENCH_KERNELS=1 bihaba-serve bench --model …` (qwen35) vs `scripts/bench_mlx_kernels.py <model>`
+(lingkungan MLX): µs dan GB/s untuk ffn gate+up, ffn down, deltanet out_proj, lm_head pada tensor asli.
+Menentukan apakah celah decode 9B ada di kernel qmv atau di tempat lain.

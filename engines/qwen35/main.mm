@@ -1782,6 +1782,44 @@ struct Qwen35Engine {
         }
     }
 
+    // ─── 1.7.0.dev5: microbench kernel M=1 pada tensor ASLI model (bandingkan dengan scripts/bench_mlx_kernels.py) ───
+    // R dispatch dalam satu command buffer, barrier di antaranya (serial seperti decode), waktu GPU / R.
+    void bench_kernels() {
+        int ld = -1, la = -1;
+        for (int l = 0; l < n_layers; ++l) {
+            if (ld < 0 && !is_moe && layers[size_t(l)].gate.N > 0) ld = l;
+            if (la < 0 && layers[size_t(l)].type == 0 && layers[size_t(l)].out_p.N > 0) la = l;
+        }
+        const int R = 100;
+        auto timeit = [&](auto&& fn) {
+            double best = 1e30;
+            for (int t = 0; t < 4; ++t) {
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                for (int r = 0; r < R; ++r) { fn(e); bar(e); }
+                [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                if (t > 0) best = std::min(best, (cb.GPUEndTime - cb.GPUStartTime) * 1e6 / R);
+            }
+            return best;
+        };
+        auto rep = [&](const char* nm, const QTensor& a, const QTensor* b2, double us) {
+            const double bytes = qt_bytes(a) + (b2 ? qt_bytes(*b2) : 0.0);
+            printf("   %-20s N=%-6d K=%-6d %db : %8.1f us  %5.0f GB/s\n", nm, a.N, a.K, a.bits, us, bytes / (us * 1e3));
+        };
+        printf("▸ Kernel microbench bihaba (M=1, R=%d, barrier di antara, waktu GPU):\n", R);
+        if (ld >= 0) {
+            const auto& L = layers[size_t(ld)];
+            rep("ffn gate+up", L.gate, &L.up, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, L.gate, L.up, b_dense_h); }));
+            rep("ffn down", L.down, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, L.down, b_x, false); }));
+        }
+        if (la >= 0) {
+            const auto& L = layers[size_t(la)];
+            rep("deltanet out_proj", L.out_p, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dn_out, L.out_p, b_x, false); }));
+        }
+        rep("lm_head", lm_head, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lm_head, b_logits, false); }));
+        reset_states();
+    }
+
     // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
     void cpu_top64(int m, int32_t* ids, float* vals) const {
         const __fp16* row = (const __fp16*)[b_logits contents] + size_t(m) * size_t(vocab);
@@ -2237,6 +2275,7 @@ int main(int argc, char** argv) {
                        gbs > 0 ? mb_tok / gbs : 0.0);
             }
 
+            if (const char* kv = getenv("BIHABA_BENCH_KERNELS")) { if (atoi(kv) > 0) eng.bench_kernels(); }
             if (const char* ov = getenv("BIHABA_BENCH_OVERHEAD")) {   // Fase 0 (opt-in): biaya dispatch/barrier
                 if (atoi(ov) > 0) eng.bench_overhead(std::max(64, bench_toks / 2));
             }
