@@ -1,5 +1,31 @@
 # Catatan Teknis bihaba-serve: temuan, perubahan, dan peta jalan
 
+## 0. ATURAN KERJA (wajib untuk siapa pun: manusia atau AI)
+Aturan ini lahir dari kesalahan nyata pada 26–27 Nov 2026 (lihat §8–§9). Aturan ditulis di repo, bukan di ingatan siapa pun.
+
+1. **Empat kelas model, empat keputusan.** Setiap perubahan dinilai terpisah untuk:
+   - transformer kecil (MNN 0.3B);
+   - transformer menengah (Bihaba-AI-1.7B);
+   - qwen35 dense (Qwythos-9B);
+   - qwen35 MoE (Bihaba-bagus-pakai).
+
+   Setelan tidak pernah disamaratakan. Kebijakan per kelas ditulis eksplisit di kode (contoh: `SESSION_CACHE_BY_ENGINE`).
+2. **Satu perintah uji, sebelum push apa pun:** `python3 scripts/uji_semua.py`. Build hanya boleh naik ke stabil bila hasilnya **LULUS SEMUA**:
+   - kebenaran kernel;
+   - jawaban chat identik dengan acuan;
+   - tidak ada angka kecepatan yang turun lebih dari 5%.
+3. **Acuan = versi yang sudah dinilai baik oleh pemilik proyek**, disimpan dengan `uji_semua.py --simpan-acuan` di folder `~/bihaba-acuan`. Acuan hanya diganti setelah versi baru LULUS dan dipakai.
+4. **Yang sudah bagus tidak boleh turun.** Perbaikan yang menurunkan kelas lain ditolak, bukan kelas lain yang dikorbankan.
+5. **Fitur yang mengubah input model** (template, riwayat, cache) mati secara default, kecuali di kelas yang sudah terbukti identik jawabannya.
+6. **Dugaan ditulis sebagai dugaan.** Yang dicatat sebagai fakta hanya angka yang diukur di Mac pemilik proyek.
+7. **Eksperimen di `~/bihaba-dev`, stabil di `~/bihaba-serve` + GitHub `main`.** Eksperimen tidak pernah di-push.
+8. **Aturan Metal yang sudah memakan korban** dicek otomatis oleh `TestMetalLint`:
+   - variabel `threadgroup` hanya boleh di scope kernel;
+   - tidak boleh memakai `INFINITY` (gunakan `-1e30f`);
+   - akumulator simdgroup tidak boleh berupa array.
+9. **Batas fisik disebut di awal, bukan di akhir.** Lihat roofline §7: decode M=1 ≤ bandwidth / byte per token.
+
+
 Dokumen kerja untuk siapa pun (manusia atau AI) yang melanjutkan pengembangan.
 Semua angka diukur di **Apple M1 Max 64 GB**, dengan model yang sama dan dalam sesi yang sama.
 Ini kecuali disebut lain.
@@ -99,6 +125,7 @@ mlx-lm 0.29.1 menolak `qwen3_5` (Qwythos/MoE). Versi itu tertahan karena Python 
 | v1.4 | Web Console bawaan di `/` (same-origin, tanpa CORS) |
 | v1.5-dev | Revisi kolaborator (qwen35) + port ke transformer: tile DN/QKV MMA per tensor (perbaiki batas segmen yang bukan kelipatan 32), race `sm_ss` antar-token di `deltanet_recurrent_spec`, emisi dipotong `n_keep` sebelum commit (cache prefix percakapan berikutnya tetap cocok), tolak bit-width tanpa kernel (qwen35 M=1: 2/3/4/8; expert MoE: 2/3/4), QoS USER_INTERACTIVE, command buffer unretained + autoreleasepool, GEMM lewati MMA untuk setengah tile kosong. Roofline + `qmv_4b_r4` A/B. |
 | v1.5-dev (2) | Review AI kolaborator: **cache sesi token-eksak** (multi-giliran tadinya selalu prefill ulang seluruh riwayat karena blok `<think></think>` kosong di template qwen35 tidak ikut dirender ulang → prefix pecah); **cancel SIGUSR1** saat stop sequence / klien putus (engine tadinya jalan sampai max_tokens sambil memegang lock); detokenizer inkremental (O(n) bukan O(n²)); stop filter menahan potongan stop; `disable_nagle_algorithm`. Flag `--no-session-cache`. |
+| **v1.6.2** | `scripts/uji_semua.py` (satu perintah untuk 4 kelas, LULUS/GAGAL terhadap acuan) + §0 Aturan Kerja. Tanpa perubahan runtime. |
 | **v1.6.1** | Cache sesi **per kelas model**: aktif untuk qwen35 (Qwythos, MoE; perilaku cepat v1.5.0), mati untuk transformer (model kecil). Kesalahan v1.5.1–v1.6.0: satu setelan global untuk semua kelas sehingga Qwythos kembali lambat. |
 | **v1.6.0** | Attention decode split-sequence (flash-decoding 2 pass) untuk konteks ≥1024, **aktif di engine transformer saja**. Konteks dibatasi ke `max_position_embeddings`. Tes lint Metal. Lihat §9. |
 | **v1.5.1 (hotfix)** | Cache sesi dimatikan secara default (opt-in `--session-cache`). Regresi terbukti dengan `scripts/regress_chat.py`, lihat §8. |
