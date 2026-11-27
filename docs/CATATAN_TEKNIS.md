@@ -381,3 +381,16 @@ Sisa celah Qwythos vs MLX (52 vs 55.4): lm_head (1987 vs 1745 µs), down (109 vs
 ### 12.4 1.7.0.dev7: microbench diperluas
 `enc_dn_inproj` / `enc_full_qkv` dipisah dari `enc_layer_attn` (isi tidak berubah) agar bisa diukur:
 deltanet in_proj (qkv+z+a+b fused), attn q+k+v (fused), attn o_proj. Skrip MLX mengukur tensor yang sama.
+
+### 12.5 Hasil microbench lengkap Qwythos (1.7.0.dev7)
+
+Per kernel bihaba ≥ MLX untuk gate+up (199 vs 205 µs), in_proj DeltaNet fused (112 vs 166 µs untuk 4 qmm),
+attn q+k+v fused (93 vs 155 µs), o_proj/out_proj (41 µs; angka MLX untuk tensor kecil tergelembung overhead).
+Masih kalah: lm_head 1987 vs 1744 µs (−243 µs/token) dan down 108 vs 104 µs (−0.13 ms/token).
+Sisa celah decode (52 vs 55.4 tok/s) = lm_head + down + celah sinkron CPU (~0.6 ms; MLX menyembunyikannya
+dengan evaluasi asinkron).
+
+### 12.6 1.7.0.dev8: `qmv_4b_f` (pola affine_qmv_fast MLX, MIT) — opt-in
+`BIHABA_QMV4F` = 0 mati (default), 1 lm_head saja, 2 semua qmv 4-bit M=1. Tidak bit-identik (kebijakan B).
+Microbench (`BIHABA_BENCH_KERNELS=1`) menampilkan waktu per tensor, selisih logit lm_head + argmax,
+dan decode A/B 128 token (identik berapa token) untuk memutuskan default.

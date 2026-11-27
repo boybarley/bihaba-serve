@@ -423,6 +423,9 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_sw4_mmaP=nil, pso_sw2_mmaP=nil, pso_dn_in4_mmaP=nil, pso_full_qkv4_mmaP=nil;
     id<MTLComputePipelineState> pso_conv1d_prefill=nil, pso_dn_prefill=nil;
     id<MTLComputePipelineState> pso_qmv1[9], pso_qmv1_add[9];
+    // 1.7.0.dev8: qmv 4-bit M=1 pola MLX. qmv4f_mode 0 = mati, 1 = lm_head saja, 2 = semua qmv 4-bit M=1 (env BIHABA_QMV4F)
+    id<MTLComputePipelineState> pso_qmv4f = nil, pso_qmv4f_add = nil;
+    int qmv4f_mode = 0;
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
     id<MTLComputePipelineState> pso_sw1[9] = {nil};   // 1.7.0.dev6: SwiGLU M=1 skalar (env BIHABA_SW1=0 → kernel lama)
     bool use_sw1 = true;
@@ -1021,6 +1024,7 @@ struct Qwen35Engine {
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
+        if (const char* qv = getenv("BIHABA_QMV4F")) qmv4f_mode = std::max(0, std::min(2, atoi(qv)));
         if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
@@ -1068,6 +1072,7 @@ struct Qwen35Engine {
             int b = bvals[i];
             pso_qmv1[b]     = make_pso(dev, lib, qmv1_n[i], false, bf);
             pso_qmv1_add[b] = make_pso(dev, lib, qmv1_n[i], true,  bf);
+            if (b == 4) { pso_qmv4f = make_pso(dev, lib, "qmv_4b_f", false, bf); pso_qmv4f_add = make_pso(dev, lib, "qmv_4b_f", true, bf); }
             pso_qmvm[b]     = make_pso(dev, lib, qmvm_n[i], false, bf);
             pso_qmvm_add[b] = make_pso(dev, lib, qmvm_n[i], true,  bf);
             pso_sw[b]       = make_pso(dev, lib, sw_n[i],   false, bf);
@@ -1362,8 +1367,12 @@ struct Qwen35Engine {
         const NSUInteger ioff = NSUInteger(in_row) * NSUInteger(qt.K) * 2;
         const NSUInteger ooff = NSUInteger(out_row) * NSUInteger(qt.N) * 2;
         id<MTLComputePipelineState> pso; int rows_per_tg; bool multi = true;
+        NSUInteger tpg = 128;
         if (M == 1) {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
+            if (qt.bits == 4 && pso_qmv4f && (qmv4f_mode == 2 || (qmv4f_mode == 1 && cur_head))) {
+                pso = add_res ? pso_qmv4f_add : pso_qmv4f; tpg = 64;
+            }
         } else if (M >= mma_min_m(qt.bits) && mma_ok) {
             pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
             rows_per_tg = (M > MAX_M) ? 64 : 32;
@@ -1377,7 +1386,7 @@ struct Qwen35Engine {
         if (multi) { QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift}; [e setBytes:&p length:sizeof(p) atIndex:5]; }
         else       { QMVParams p{qt.K, qt.N, qt.gs_shift};         [e setBytes:&p length:sizeof(p) atIndex:5]; }
         const NSUInteger gy = (multi && rows_per_tg == 64) ? NSUInteger((M + 31) / 32) : 1;
-        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     }
 
     void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp,
@@ -1854,6 +1863,56 @@ struct Qwen35Engine {
             rep("deltanet out_proj", L.out_p, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dn_out, L.out_p, b_x, false); }));
         }
         rep("lm_head", lm_head, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lm_head, b_logits, false); }));
+
+        // 1.7.0.dev8: kernel qmv_4b_f (pola MLX) — waktu per tensor, selisih logit lm_head, decode A/B
+        if (pso_qmv4f && lm_head.bits == 4) {
+            const int saved = qmv4f_mode;
+            qmv4f_mode = 2;
+            printf("   -- qmv_4b_f (pola MLX):\n");
+            if (ld >= 0) { const auto& L = layers[size_t(ld)];
+                rep("ffn down (f)", L.down, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, L.down, b_x, false); })); }
+            if (la >= 0) { const auto& L = layers[size_t(la)];
+                rep("deltanet out_proj (f)", L.out_p, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dn_out, L.out_p, b_x, false); })); }
+            rep("lm_head (f)", lm_head, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lm_head, b_logits, false); }));
+            // selisih logit pada input nyata (hidden state setelah beberapa token)
+            reset_states(); qmv4f_mode = 0;
+            { int32_t t = 9707; for (int i = 0; i < 8; ++i) run_step_m(&t, 1, i, &t, true, RepRowsParams{}); }
+            std::vector<float> ref(static_cast<size_t>(vocab));
+            auto one = [&](int mode) {
+                qmv4f_mode = mode;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                enc_qmv(e, 1, b_xn, lm_head, b_logits, false);
+                [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            };
+            one(0); { const __fp16* lg = (const __fp16*)[b_logits contents]; for (int i = 0; i < vocab; ++i) ref[size_t(i)] = float(lg[i]); }
+            one(2);
+            { const __fp16* lg = (const __fp16*)[b_logits contents];
+              double mx = 0, mref = 0; int a0 = 0, a1 = 0;
+              for (int i = 0; i < vocab; ++i) {
+                  mx = std::max(mx, double(std::fabs(float(lg[i]) - ref[size_t(i)])));
+                  mref = std::max(mref, double(std::fabs(ref[size_t(i)])));
+                  if (ref[size_t(i)] > ref[size_t(a0)]) a0 = i;
+                  if (float(lg[i]) > float(lg[a1])) a1 = i;
+              }
+              printf("   lm_head selisih logit maks %.4f (|logit| maks %.2f) | argmax %s\n", mx, mref, a0 == a1 ? "sama" : "BEDA"); }
+            // decode A/B 128 token greedy
+            const char* nm[3] = {"lama", "lm_head f", "semua f"};
+            std::vector<int32_t> seq[3]; double tps[3] = {0, 0, 0};
+            for (int v = 0; v < 3; ++v) {
+                qmv4f_mode = v; reset_states();
+                int32_t t = 9707;
+                auto ta = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < 128; ++i) { run_step_m(&t, 1, i, &t, true, RepRowsParams{}); seq[v].push_back(t); }
+                tps[v] = 128000.0 / std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - ta).count();
+            }
+            printf("   decode A/B:");
+            for (int v = 0; v < 3; ++v) {
+                int same = 0; while (same < 128 && seq[v][size_t(same)] == seq[0][size_t(same)]) same++;
+                printf(" %s %.1f tok/s (identik %d/128)%s", nm[v], tps[v], same, v < 2 ? " |" : "\n");
+            }
+            qmv4f_mode = saved;
+        }
         reset_states();
     }
 

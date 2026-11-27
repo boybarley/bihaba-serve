@@ -2298,5 +2298,54 @@ kernel void NAME(device const float* pml [[buffer(0)]], device const float* po [
 DECL_ATTN_SPLIT(attn_split_256, 256)
 DECL_ATTN_MERGE(attn_merge_256_gated, 256, true)
 
+
+// ─── 1.7.0.dev8: qmv 4-bit M=1 pola affine_qmv_fast MLX (MIT, © Apple): 2 simdgroup × 4 baris per TG,
+// x dipra-skala (1, 1/16, 1/256, 1/4096) agar nibble cukup di-mask tanpa shift, akumulasi float,
+// y = s·Σ(x·q) + b·Σx per grup. Urutan reduksi BEDA dari qmv_4b → tidak bit-identik (kebijakan B).
+kernel void qmv_4b_f(
+    device const half* x [[buffer(0)]], device const uint32_t* w [[buffer(1)]],
+    device const ushort* scales [[buffer(2)]], device const ushort* biases [[buffer(3)]],
+    device half* out [[buffer(4)]], constant QMVParams& p [[buffer(5)]],
+    uint tg_x [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    const int K = p.K, N = p.N, gsh = p.gs_shift;
+    const int row0 = int(tg_x) * 8 + int(sg) * 4;
+    if (row0 >= N) return;
+    const int last = min(3, N - 1 - row0);
+    const ulong kw = ulong(K >> 3), kg = ulong(K >> gsh);
+    float res[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float xt[16];
+    for (int k0 = 0; k0 < K; k0 += 512) {
+        const int gk = k0 + int(lane) * 16;
+        if (gk >= K) break;
+        const device half* xp = x + gk;
+        float sum = 0.0f;
+        for (int i = 0; i < 16; i += 4) {
+            const float a = float(xp[i]), b1 = float(xp[i + 1]), c = float(xp[i + 2]), d = float(xp[i + 3]);
+            sum += a + b1 + c + d;
+            xt[i] = a; xt[i + 1] = b1 / 16.0f; xt[i + 2] = c / 256.0f; xt[i + 3] = d / 4096.0f;
+        }
+        const int g = gk >> gsh;
+        for (int r = 0; r < 4; ++r) {
+            const ulong rr = ulong(row0 + min(r, last));
+            const device ushort* ws = (const device ushort*)(w + rr * kw + ulong(gk >> 3));
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const ushort v = ws[i];
+                acc += xt[4 * i] * float(v & 0x000fu) + xt[4 * i + 1] * float(v & 0x00f0u)
+                     + xt[4 * i + 2] * float(v & 0x0f00u) + xt[4 * i + 3] * float(v & 0xf000u);
+            }
+            res[r] += load_sb_f(scales, rr * kg + ulong(g)) * acc + sum * load_sb_f(biases, rr * kg + ulong(g));
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        const float v = simd_sum(res[r]);
+        if (lane == 0 && r <= last) {
+            if (ADD_RES_C) out[row0 + r] += half(v);
+            else           out[row0 + r]  = half(v);
+        }
+    }
+}
+
 // Fase 0: kernel kosong untuk mengukur biaya dispatch/barrier murni (dipakai hanya oleh bench_overhead)
 kernel void null_kernel() {}
