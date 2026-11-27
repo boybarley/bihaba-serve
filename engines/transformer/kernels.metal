@@ -1307,3 +1307,118 @@ kernel void bw_probe(device const float4* src [[buffer(0)]], device float* out [
     for (uint i = gid; i < n4; i += gsz) acc += src[i];
     out[gid] = acc.x + acc.y + acc.z + acc.w;
 }
+
+// ─────────────────────── Attention decode split-sequence (flash-decoding, 2 pass) ───────────────────────
+// Kernel lama: 1 threadgroup per head, 8 simdgroup masing-masing memproses seq/8 token SECARA BERURUTAN
+// (tiap token = simd_sum + exp yang saling bergantung). Di konteks 5k hanya 16 head × 8 SG aktif di seluruh
+// GPU → decode 1.7B turun 132 → 66 tok/s. Di sini sekuens dibagi ke n_blk threadgroup per head (pass 1),
+// lalu hasil parsial digabung dengan log-sum-exp (pass 2). Matematika sama; hanya urutan penjumlahan beda.
+struct AttnSplitParams { int M, n_heads, n_kv_heads, pos, max_seq, n_blk; };
+
+template <int HD>
+inline void attn_split_impl(device const half* q_buf, device const half* k_cache, device const half* v_cache,
+                            device float* part_ml, device float* part_o, constant AttnSplitParams& p,
+                            threadgroup float* sm_m, threadgroup float* sm_s, threadgroup float* sm_o,
+                            uint3 tg, uint sg, uint lane)
+{
+    constexpr int E = HD / 32;
+    const int h = int(tg.x), b = int(tg.y), m = int(tg.z);
+    if (h >= p.n_heads || b >= p.n_blk || m >= p.M) return;
+    const int kv_h = h / (p.n_heads / p.n_kv_heads), seq_len = p.pos + m + 1;
+    const int bl = (seq_len + p.n_blk - 1) / p.n_blk;
+    const int b0 = min(b * bl, seq_len), b1 = min(b0 + bl, seq_len);
+    const int sl = ((b1 - b0) + 7) >> 3, t0 = b0 + int(sg) * sl, t1 = min(t0 + sl, b1);
+    const float scale = rsqrt(float(HD)) * LOG2E;
+    const int qb = (m * p.n_heads + h) * HD + int(lane) * E;
+    float q[E], o[E];
+    #pragma unroll
+    for (int e = 0; e < E; ++e) { q[e] = float(q_buf[qb + e]) * scale; o[e] = 0.0f; }
+    float ms = -1e30f, se = 0.0f;
+    const ulong base = ulong(kv_h) * ulong(p.max_seq) * ulong(HD) + ulong(lane) * ulong(E);
+    for (int t = t0; t < t1; ++t) {
+        const ulong ko = base + ulong(t) * ulong(HD);
+        float d = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < E; ++e) d += q[e] * float(k_cache[ko + e]);
+        const float s = simd_sum(d);
+        const float nm = max(ms, s), al = (se > 0.0f) ? exp2(ms - nm) : 0.0f, w = exp2(s - nm);
+        se = se * al + w;
+        #pragma unroll
+        for (int e = 0; e < E; ++e) o[e] = o[e] * al + w * float(v_cache[ko + e]);
+        ms = nm;
+    }
+    // sm_m/sm_s [8], sm_o [8*HD]: dideklarasikan di kernel (threadgroup hanya boleh di scope kernel)
+    if (lane == 0) { sm_m[sg] = ms; sm_s[sg] = se; }
+    #pragma unroll
+    for (int e = 0; e < E; ++e) sm_o[int(sg) * HD + int(lane) * E + e] = o[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float gm = -1e30f;
+        for (int s = 0; s < 8; ++s) if (sm_s[s] > 0.0f) gm = max(gm, sm_m[s]);
+        float gs = 0.0f, acc[E];
+        #pragma unroll
+        for (int e = 0; e < E; ++e) acc[e] = 0.0f;
+        for (int s = 0; s < 8; ++s) if (sm_s[s] > 0.0f) {
+            const float ws = exp2(sm_m[s] - gm);
+            gs += sm_s[s] * ws;
+            #pragma unroll
+            for (int e = 0; e < E; ++e) acc[e] += sm_o[s * HD + int(lane) * E + e] * ws;
+        }
+        const int pi = (m * p.n_heads + h) * p.n_blk + b;
+        if (lane == 0) { part_ml[pi * 2] = gm; part_ml[pi * 2 + 1] = gs; }
+        #pragma unroll
+        for (int e = 0; e < E; ++e) part_o[ulong(pi) * HD + int(lane) * E + e] = acc[e];
+    }
+}
+
+template <int HD, bool GATED>
+inline void attn_merge_impl(device const float* part_ml, device const float* part_o, device const half* gate_buf,
+                            device half* attn_out, constant AttnSplitParams& p, uint2 tg, uint lane)
+{
+    constexpr int E = HD / 32;
+    const int h = int(tg.x), m = int(tg.y);
+    if (h >= p.n_heads || m >= p.M) return;
+    const int base = (m * p.n_heads + h) * p.n_blk;
+    float gm = -1e30f;
+    for (int b = 0; b < p.n_blk; ++b) if (part_ml[(base + b) * 2 + 1] > 0.0f) gm = max(gm, part_ml[(base + b) * 2]);
+    float gs = 0.0f, acc[E];
+    #pragma unroll
+    for (int e = 0; e < E; ++e) acc[e] = 0.0f;
+    for (int b = 0; b < p.n_blk; ++b) {
+        const float s = part_ml[(base + b) * 2 + 1];
+        if (s > 0.0f) {
+            const float ws = exp2(part_ml[(base + b) * 2] - gm);
+            gs += s * ws;
+            #pragma unroll
+            for (int e = 0; e < E; ++e) acc[e] += part_o[ulong(base + b) * HD + int(lane) * E + e] * ws;
+        }
+    }
+    const float inv = 1.0f / max(gs, 1e-12f);
+    const int qb = (m * p.n_heads + h) * HD + int(lane) * E;
+    #pragma unroll
+    for (int e = 0; e < E; ++e) {
+        float v = acc[e] * inv;
+        if (GATED) { const float g = float(gate_buf[qb + e]); v = v / (1.0f + exp(-g)); }
+        attn_out[qb + e] = half(v);
+    }
+}
+
+#define DECL_ATTN_SPLIT(NAME, HD) \
+kernel void NAME(device const half* q [[buffer(0)]], device const half* kc [[buffer(1)]], device const half* vc [[buffer(2)]], \
+    device float* pml [[buffer(3)]], device float* po [[buffer(4)]], constant AttnSplitParams& p [[buffer(5)]], \
+    uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    threadgroup float sm_m[8], sm_s[8], sm_o[8 * HD]; \
+    attn_split_impl<HD>(q, kc, vc, pml, po, p, sm_m, sm_s, sm_o, tg, sg, lane); \
+}
+#define DECL_ATTN_MERGE(NAME, HD, GATED) \
+kernel void NAME(device const float* pml [[buffer(0)]], device const float* po [[buffer(1)]], device const half* gate [[buffer(2)]], \
+    device half* out [[buffer(3)]], constant AttnSplitParams& p [[buffer(4)]], \
+    uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) \
+{ attn_merge_impl<HD, GATED>(pml, po, gate, out, p, tg, lane); }
+DECL_ATTN_SPLIT(attn_split_64, 64)
+DECL_ATTN_SPLIT(attn_split_128, 128)
+DECL_ATTN_SPLIT(attn_split_256, 256)
+DECL_ATTN_MERGE(attn_merge_64, 64, false)
+DECL_ATTN_MERGE(attn_merge_128, 128, false)
+DECL_ATTN_MERGE(attn_merge_256, 256, false)

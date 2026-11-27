@@ -44,6 +44,7 @@ struct Conv1dParams     { int32_t M, C, k_size; };
 struct DeltaNetParams   { int32_t M, n_kh, n_vh, k_hd, v_hd; float eps; };
 struct QKNormRopeParams { int32_t M, n_heads, n_kv_heads, head_dim, rope_dim, pos, max_seq; float eps; };
 struct GQA256Params     { int32_t M, n_heads, n_kv_heads, pos, max_seq; };
+struct AttnSplitParams  { int32_t M, n_heads, n_kv_heads, pos, max_seq, n_blk; };
 struct TopKParams       { int32_t M, E, top_k; };
 struct MoEProjParams    { int32_t M, K, N, top_k, gs_shift; uint64_t stride_w, stride_s; };
 // Repetition penalty PER BARIS (lihat build_rep_rows). setBytes ≤ 4 KB: 8 baris × 65 int = 2.1 KB.
@@ -308,6 +309,14 @@ struct Qwen35Engine {
 
     QTensor embed, lm_head;
     id<MTLComputePipelineState> pso_bw = nil;
+    // Attention decode split-sequence: dipakai bila konteks ≥ attn_split_min (env BIHABA_ATTN_SPLIT=0 → mati)
+    id<MTLComputePipelineState> pso_attn_split = nil, pso_attn_merge = nil;
+    id<MTLBuffer> b_part_ml = nil, b_part_o = nil;
+    // qwen35: MATI default. A/B v1.6 (M1 Max): Qwythos +3% identik 64/64, MoE +10% tetapi greedy menyimpang di
+    // token 32/64 (kemungkinan seri fp16 yang diperbesar routing MoE, belum dibuktikan) → aktifkan hanya untuk uji:
+    // BIHABA_ATTN_SPLIT=1024
+    int attn_split_min = 1 << 30;
+    static constexpr int ATTN_MAX_BLK = 32;
     double last_gpu_ms = 0.0;           // durasi GPU command buffer run_step terakhir
 
     // ─── Roofline: byte yang WAJIB dibaca per token decode vs bandwidth memori terukur ───
@@ -938,6 +947,9 @@ struct Qwen35Engine {
         pso_dn_prefill    = make_pso(dev, lib, "deltanet_recurrent_prefill",   false, bf);
         pso_argmax        = make_pso(dev, lib, "argmax_full",             false, bf);
         pso_bw            = make_pso(dev, lib, "bw_probe",                false, bf);
+        pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
+        pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
+        if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
         pso_dn_in4        = make_pso(dev, lib, "deltanet_in_proj_4b",     false, bf);
         pso_dn_in4_m1     = make_pso(dev, lib, "deltanet_in_proj_4b_m1",  false, bf);
@@ -1030,6 +1042,8 @@ struct Qwen35Engine {
         b_top64_ids  = mkbuf(MAX_M * 64 * sizeof(int32_t));
         b_top64_vals = mkbuf(MAX_M * 64 * sizeof(float));
         b_top64_flag = mkbuf(MAX_M * sizeof(int32_t));
+        b_part_ml    = mkbuf(size_t(MAX_M) * n_heads * ATTN_MAX_BLK * 2 * sizeof(float));
+        b_part_o     = mkbuf(size_t(MAX_M) * n_heads * ATTN_MAX_BLK * head_dim * sizeof(float));
 
         conv_states.resize(n_layers, nil); dn_states.resize(n_layers, nil);
         k_caches.resize(n_layers, nil);    v_caches.resize(n_layers, nil);
@@ -1435,13 +1449,29 @@ struct Qwen35Engine {
             [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             bar(e);
 
-            GQA256Params gp{M, n_heads, n_kv_heads, pos, max_seq};
-            [e setComputePipelineState:pso_gqa256];
-            [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:b_gate offset:0 atIndex:1];
-            [e setBuffer:k_caches[l] offset:0 atIndex:2]; [e setBuffer:v_caches[l] offset:0 atIndex:3];
-            [e setBuffer:b_att offset:0 atIndex:4]; [e setBytes:&gp length:sizeof(gp) atIndex:5];
-            [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            bar(e);
+            if (M <= MAX_M && pos + M >= attn_split_min && pso_attn_split) {
+                // Konteks panjang: bagi sekuens ke n_blk threadgroup per head (≈256 token per blok), lalu gabungkan.
+                const int nblk = std::min(int(ATTN_MAX_BLK), (pos + M + 255) / 256);
+                AttnSplitParams ap{M, n_heads, n_kv_heads, pos, max_seq, nblk};
+                [e setComputePipelineState:pso_attn_split];
+                [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:k_caches[l] offset:0 atIndex:1]; [e setBuffer:v_caches[l] offset:0 atIndex:2];
+                [e setBuffer:b_part_ml offset:0 atIndex:3]; [e setBuffer:b_part_o offset:0 atIndex:4]; [e setBytes:&ap length:sizeof(ap) atIndex:5];
+                [e dispatchThreadgroups:MTLSizeMake(n_heads, nblk, M) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                bar(e);
+                [e setComputePipelineState:pso_attn_merge];
+                [e setBuffer:b_part_ml offset:0 atIndex:0]; [e setBuffer:b_part_o offset:0 atIndex:1]; [e setBuffer:b_gate offset:0 atIndex:2];
+                [e setBuffer:b_att offset:0 atIndex:3]; [e setBytes:&ap length:sizeof(ap) atIndex:4];
+                [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                bar(e);
+            } else {
+                GQA256Params gp{M, n_heads, n_kv_heads, pos, max_seq};
+                [e setComputePipelineState:pso_gqa256];
+                [e setBuffer:b_q offset:0 atIndex:0]; [e setBuffer:b_gate offset:0 atIndex:1];
+                [e setBuffer:k_caches[l] offset:0 atIndex:2]; [e setBuffer:v_caches[l] offset:0 atIndex:3];
+                [e setBuffer:b_att offset:0 atIndex:4]; [e setBytes:&gp length:sizeof(gp) atIndex:5];
+                [e dispatchThreadgroups:MTLSizeMake(n_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                bar(e);
+            }
 
             enc_qmv(e, M, b_att, L.o, b_x, true);
             bar(e);
@@ -2034,6 +2064,39 @@ int main(int argc, char** argv) {
                 printf("▸ Waktu/token: total %.2f ms | GPU %.2f ms | CPU+sinkron %.2f ms (%.0f%%) | ideal-bandwidth %.2f ms\n",
                        wall_tok, gpu_tok, wall_tok - gpu_tok, 100.0 * (wall_tok - gpu_tok) / wall_tok,
                        gbs > 0 ? mb_tok / gbs : 0.0);
+            }
+
+            {   // Decode di konteks panjang: attention lama vs split-sequence (hasil greedy harus identik)
+                const int ctx = std::min(3072, eng.max_seq - 200);
+                if (ctx >= 1024 && eng.pso_attn_split) {
+                    std::vector<int32_t> lp(static_cast<size_t>(ctx));
+                    for (size_t i = 0; i < lp.size(); ++i) lp[i] = int32_t((i * 7919u + 13u) % uint32_t(std::min(eng.vocab, 150000)));
+                    std::vector<int32_t> seqs[2];
+                    std::vector<float> marg[2];          // selisih logit top-1 − top-2 tiap langkah (bukti seri fp16)
+                    double ms_v[2] = {0, 0};
+                    int32_t i64[64]; float v64[64];
+                    const int saved = eng.attn_split_min;
+                    for (int v = 0; v < 2; ++v) {
+                        eng.attn_split_min = v ? 1024 : (1 << 30);
+                        eng.reset_states(); eng.ram_snap = StateSnapshot{};
+                        int lpos = 0; int32_t t = 0;
+                        eng.prefill_range(lp, 0, lp.size(), lpos, true, false, &t, nullptr, nullptr);
+                        auto ta = std::chrono::high_resolution_clock::now();
+                        for (int i = 0; i < 64; ++i) {
+                            eng.run_step_m(&t, 1, lpos, &t, true, rp1, nullptr, true, i64, v64);
+                            seqs[v].push_back(t); marg[v].push_back(v64[0] - v64[1]); lpos++;
+                        }
+                        ms_v[v] = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - ta).count();
+                    }
+                    eng.attn_split_min = saved;
+                    int same = 0;
+                    while (same < 64 && seqs[0][size_t(same)] == seqs[1][size_t(same)]) same++;
+                    printf("▸ Decode @%d token konteks: attention lama %.1f tok/s | split %.1f tok/s (%+.0f%%) | greedy identik %d/64",
+                           ctx, 64000.0 / ms_v[0], 64000.0 / ms_v[1], 100.0 * (ms_v[0] / ms_v[1] - 1.0), same);
+                    if (same < 64)   // seri: selisih top-1/top-2 di titik beda ≈ resolusi fp16 (≤ ~0.06) → bukan bug
+                        printf(" | selisih logit top1-top2 di token %d: lama %.4f, split %.4f", same, marg[0][size_t(same)], marg[1][size_t(same)]);
+                    printf(" (aktif default: %s)\n", saved < (1 << 30) ? "ya" : "tidak");
+                }
             }
 
             // Prefill A/B: chunk 8 (perilaku lama) vs chunk aktif, prompt 512 token (token acak; hanya waktu yang diukur)

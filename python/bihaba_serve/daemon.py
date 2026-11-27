@@ -109,7 +109,7 @@ class EngineDaemon:
         load_state: str | None = None,
         default_temp: float = 0.0,
         prefill_chunk: int = 128,
-        session_cache: bool = True,
+        session_cache: bool = False,   # MATI default: riwayat versi sesi tidak kanonik → jawaban model bisa berubah (lihat CATATAN_TEKNIS §8)
     ):
         self.info = model_info
         self.session_cache = session_cache

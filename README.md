@@ -146,6 +146,13 @@ bihaba-serve bench --model ~/models/Bihaba-bagus-pakai --top-k 4 --profile --tok
 
 ---
 
+## What's new in v1.6
+- **Long-context decode for dense Qwen3/Llama models:** the sequence is split across threadgroups (flash-decoding). At a 3k-token context: 0.3B goes 130 → 250 tok/s, and 1.7B goes 81 → 109 tok/s. Greedy output is identical. It is off for Qwen3.5 (small gain there); enable it with `BIHABA_ATTN_SPLIT=1024`.
+- **Context limit:** the context is capped at the model's `max_position_embeddings`, so a conversation fails with a clear message instead of degrading silently.
+- **`scripts/regress_chat.py --save/--compare`:** an end-to-end answer regression against the stable version (4 model families).
+- **Metal lint in the offline tests.**
+- **Session cache** is opt-in (`--session-cache`), because it changes the model's view of the history.
+
 ## What's new in v1.5
 
 **Server**

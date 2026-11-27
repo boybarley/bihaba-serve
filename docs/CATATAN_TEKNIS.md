@@ -99,6 +99,8 @@ mlx-lm 0.29.1 menolak `qwen3_5` (Qwythos/MoE). Versi itu tertahan karena Python 
 | v1.4 | Web Console bawaan di `/` (same-origin, tanpa CORS) |
 | v1.5-dev | Revisi kolaborator (qwen35) + port ke transformer: tile DN/QKV MMA per tensor (perbaiki batas segmen yang bukan kelipatan 32), race `sm_ss` antar-token di `deltanet_recurrent_spec`, emisi dipotong `n_keep` sebelum commit (cache prefix percakapan berikutnya tetap cocok), tolak bit-width tanpa kernel (qwen35 M=1: 2/3/4/8; expert MoE: 2/3/4), QoS USER_INTERACTIVE, command buffer unretained + autoreleasepool, GEMM lewati MMA untuk setengah tile kosong. Roofline + `qmv_4b_r4` A/B. |
 | v1.5-dev (2) | Review AI kolaborator: **cache sesi token-eksak** (multi-giliran tadinya selalu prefill ulang seluruh riwayat karena blok `<think></think>` kosong di template qwen35 tidak ikut dirender ulang → prefix pecah); **cancel SIGUSR1** saat stop sequence / klien putus (engine tadinya jalan sampai max_tokens sambil memegang lock); detokenizer inkremental (O(n) bukan O(n²)); stop filter menahan potongan stop; `disable_nagle_algorithm`. Flag `--no-session-cache`. |
+| **v1.6.0** | Attention decode split-sequence (flash-decoding 2 pass) untuk konteks ≥1024, **aktif di engine transformer saja**. Konteks dibatasi ke `max_position_embeddings`. Tes lint Metal. Lihat §9. |
+| **v1.5.1 (hotfix)** | Cache sesi dimatikan secara default (opt-in `--session-cache`). Regresi terbukti dengan `scripts/regress_chat.py`, lihat §8. |
 | **v1.5 (stabil)** | Semua di atas. `qmv_4b_r4` dihapus setelah A/B (hasil negatif, lihat bagian 7). |
 | v1.4.2 | `POST /v1/state/clear` + tombol "Hapus bake": buang snapshot system prompt dari RAM GPU |
 
@@ -191,3 +193,32 @@ Kernel ini menangani 4 baris per simdgroup dengan 16 byte per lane. Hasilnya: Qw
 
 - **Tanpa cache:** sekitar 21 detik per giliran (5.9k token dengan laju 279 tok/s).
 - **Catatan:** prefill ekor sekitar 300 ms untuk puluhan token masih mahal. Penyebabnya attention prefill naif yang membaca seluruh riwayat per token. Ini kandidat berikutnya: attention ber-tile (flash-attention MMA).
+
+---
+
+## 8. Regresi v1.5: cache sesi mengubah jawaban model (dibuktikan `scripts/regress_chat.py`)
+
+Percakapan 3 giliran, greedy. A = riwayat dirender ulang secara kanonik, B = cache sesi.
+- **Bihaba-AI-1.7B:** giliran 1 identik (tanpa riwayat). Di giliran 2–3, jawaban B **berubah**: bergeser ke kosakata Aceh ("areueng lembab", "hana buah"), sementara A tetap berbahasa Indonesia.
+- **Penyebab:** di B, riwayat jawaban lama tetap membawa blok `<think>\n\n</think>\n\n` kosong, persis seperti saat model menghasilkannya. Template kanonik Qwen3 merender jawaban lama TANPA blok itu. Model yang di-fine-tune dengan template kanonik melihat format di luar distribusinya, sehingga perilakunya bergeser.
+- **Pelajaran:** cek `=greedy`/`Prefill check` hanya menguji konsistensi engine. Fitur yang mengubah **input** model (template, riwayat) harus diuji dengan membandingkan jawaban terhadap jalur kanonik, di **semua** model.
+- **Arah perbaikan yang aman:**
+  - engine transformer (attention murni) bisa memakai ulang prefix SEBAGIAN: KV di belakang LCP cukup ditimpa, sehingga riwayat kanonik tetap dipakai dan TTFT tetap cepat;
+  - engine qwen35 (DeltaNet) tidak bisa mundur, jadi butuh checkpoint state di awal setiap jawaban.
+- **MNN-Pocket 0.3B:** jawaban sudah ngawur di giliran 1 (tanpa riwayat), baik di A maupun B. Ini bukan akibat cache sesi. Perlu pembanding mlx-lm untuk memastikan apakah ini batas kualitas model atau masalah template/engine.
+
+---
+
+## 9. v1.6: attention decode di konteks panjang (M1 Max, konteks 3072, 64 token greedy)
+
+| Model | Attention lama | Split | Greedy | Default |
+|---|---|---|---|---|
+| MNN-Pocket 0.3B | 129.7 tok/s | **250.5 tok/s (+93%)** | identik 64/64 | aktif |
+| Bihaba-AI-1.7B | 81.2 tok/s | **109.3 tok/s (+35%)** | identik 64/64 | aktif |
+| Qwythos-9B | 43.4 tok/s | 44.8 tok/s (+3%) | identik 64/64 | mati |
+| MoE 35B-A3B | 83.1 tok/s | 91.0 tok/s (+10%) | **menyimpang di token 32** | mati |
+
+- **Penyebab kernel lama lambat:** di konteks panjang, satu threadgroup per head memproses ribuan token secara berurutan.
+- **Kenapa hanya transformer yang diaktifkan:** di engine qwen35 hanya ¼ layer yang memakai attention, sehingga untungnya kecil. Di MoE, greedy menyimpang di token 32. Kemungkinan itu seri fp16 yang diperbesar routing expert, tapi belum dibuktikan. Bench v1.6 kini mencetak selisih logit top-1/top-2 di titik beda untuk membuktikannya. Uji di qwen35: `BIHABA_ATTN_SPLIT=1024`.
+- **Regresi chat** (`regress_chat.py --compare`, 4 model): **LULUS**, semua jawaban identik dengan versi stabil.
+- **Kesalahan yang sempat lolos:** variabel `threadgroup` di fungsi pembantu (aturan Metal yang sudah tercatat). Sekarang dicegah oleh `TestMetalLint` di tes offline.

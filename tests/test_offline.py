@@ -509,5 +509,72 @@ class TestStreaming(unittest.TestCase):
             d.proc.kill(); d.proc.wait(); d.proc.stdin.close(); d.proc.stdout.close()
 
 
+# ─── Port dari attn_split_impl + attn_merge_impl (flash-decoding 2 pass) vs softmax attention biasa ──────
+@unittest.skipIf(np is None, "numpy tidak tersedia")
+class TestAttnSplit(unittest.TestCase):
+    @staticmethod
+    def split_merge(q, K, V, n_blk):
+        L, HD = K.shape
+        LOG2E = 1.4426950408889634
+        qs = q * (1.0 / np.sqrt(HD)) * LOG2E
+        parts = []
+        bl = (L + n_blk - 1) // n_blk
+        for b in range(n_blk):
+            b0, b1 = min(b * bl, L), min(b * bl + bl, L)
+            sl = ((b1 - b0) + 7) >> 3
+            sgs = []
+            for sg in range(8):                         # 8 simdgroup, masing-masing online-softmax berurutan
+                t0, t1 = b0 + sg * sl, min(b0 + sg * sl + sl, b1)
+                ms, se, o = -1e30, 0.0, np.zeros(HD)
+                for t in range(t0, t1):
+                    s = float(qs @ K[t]); nm = max(ms, s)
+                    al = 2.0 ** (ms - nm) if se > 0 else 0.0; w = 2.0 ** (s - nm)
+                    se = se * al + w; o = o * al + w * V[t]; ms = nm
+                sgs.append((ms, se, o))
+            gm = max([m for m, s_, _ in sgs if s_ > 0], default=-1e30)
+            gs, acc = 0.0, np.zeros(HD)
+            for m, s_, o in sgs:
+                if s_ > 0:
+                    ws = 2.0 ** (m - gm); gs += s_ * ws; acc += o * ws
+            parts.append((gm, gs, acc))
+        gm = max([m for m, s_, _ in parts if s_ > 0], default=-1e30)
+        gs, acc = 0.0, np.zeros(HD)
+        for m, s_, o in parts:
+            if s_ > 0:
+                ws = 2.0 ** (m - gm); gs += s_ * ws; acc += o * ws
+        return acc / max(gs, 1e-12)
+
+    def test_matches_reference(self):
+        rng = np.random.default_rng(3)
+        for L, HD, nblk in [(1030, 64, 5), (3000, 128, 12), (257, 256, 2), (40, 128, 32)]:
+            q, K, V = rng.standard_normal(HD), rng.standard_normal((L, HD)) * 2, rng.standard_normal((L, HD))
+            s = K @ q / np.sqrt(HD); p = np.exp(s - s.max()); ref = (p / p.sum()) @ V
+            np.testing.assert_allclose(self.split_merge(q, K, V, nblk), ref, rtol=1e-6, atol=1e-9)
+
+
+# ─── Lint Metal: aturan yang sudah dua kali memakan korban di Mac ──────────────────────────────
+class TestMetalLint(unittest.TestCase):
+    FILES = ["engines/transformer/kernels.metal", "engines/qwen35/kernels.metal"]
+
+    def test_threadgroup_vars_only_at_kernel_scope(self):
+        import re
+        root = Path(__file__).resolve().parents[1]
+        bad = []
+        for f in self.FILES:
+            cur = None
+            for i, line in enumerate((root / f).read_text().split("\n"), 1):
+                m = re.match(r"^(inline|template|kernel|#define|static)\b", line)
+                if m:
+                    cur = m.group(1)
+                if re.match(r"\s+threadgroup\s+\w+\s+\w+\s*\[", line) and cur in ("inline", "template"):
+                    bad.append(f"{f}:{i}: {line.strip()}")
+        self.assertEqual(bad, [], "variabel threadgroup di fungsi non-kernel (Metal menolak):\n" + "\n".join(bad))
+
+    def test_no_infinity_with_fast_math(self):
+        root = Path(__file__).resolve().parents[1]
+        for f in self.FILES:
+            self.assertNotIn("INFINITY", (root / f).read_text(), f"{f}: pakai -1e30f (fast-math)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
