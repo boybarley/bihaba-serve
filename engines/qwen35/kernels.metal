@@ -2347,5 +2347,168 @@ kernel void qmv_4b_f(
     }
 }
 
+
+// ═════════════ 1.7.0.dev10: expert MoE berkelompok (prefill, 4-bit, bit-identik) ═════════════
+// moe_group: 1 threadgroup. Hitung jumlah pasangan per expert, offset (prefix), dan daftar pasangan per expert
+// berurutan menurut id pasangan (deterministik, tanpa ketergantungan urutan atomik).
+kernel void moe_group(
+    device const int* top_ids [[buffer(0)]], device int* g_cnt [[buffer(1)]], device int* g_off [[buffer(2)]],
+    device int* g_pairs [[buffer(3)]], constant TopKParams& p [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]])
+{
+    threadgroup int ids[1024];
+    threadgroup atomic_int cnt[512];
+    threadgroup int off[512];
+    const int P = p.M * p.top_k, E = p.E;
+    for (int i = int(tid); i < E; i += int(ntg)) atomic_store_explicit(&cnt[i], 0, memory_order_relaxed);
+    for (int i = int(tid); i < P; i += int(ntg)) ids[i] = top_ids[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(tid); i < P; i += int(ntg)) atomic_fetch_add_explicit(&cnt[ids[i]], 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int s = 0;
+        for (int e = 0; e < E; ++e) {
+            const int c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            off[e] = s; g_off[e] = s; g_cnt[e] = c; s += c;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(tid); i < P; i += int(ntg)) {
+        const int e = ids[i];
+        int r = 0;
+        for (int j = 0; j < i; ++j) r += (ids[j] == e) ? 1 : 0;
+        g_pairs[off[e] + r] = i;
+    }
+}
+
+// Gate+Up berkelompok: grid = ((N+7)/8, E). Baris sama dengan moe_swiglu_3d_impl (2 baris/simdgroup),
+// token diproses per ubin 4: bobot & skala dibaca sekali per langkah K untuk 4 token.
+kernel void moe_swiglu_g4(
+    device const half* x [[buffer(0)]], device const int* g_cnt [[buffer(1)]], device const int* g_off [[buffer(2)]],
+    device const int* g_pairs [[buffer(3)]],
+    device const uint32_t* wg [[buffer(4)]], device const ushort* sg_a [[buffer(5)]], device const ushort* bg_a [[buffer(6)]],
+    device const uint32_t* wu [[buffer(7)]], device const ushort* su_a [[buffer(8)]], device const ushort* bu_a [[buffer(9)]],
+    device half* out [[buffer(10)]], constant MoEProjParams& p [[buffer(11)]],
+    uint3 tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    const int row0 = (int(tg_id.x) * 4 + int(sg)) * 2;
+    const int ei = int(tg_id.y);
+    if (row0 >= p.N) return;
+    const int c = g_cnt[ei];
+    if (c == 0) return;
+    const int base = g_off[ei];
+    const int r0 = row0, r1 = min(row0 + 1, p.N - 1);
+    const ulong e = ulong(ei);
+    const int K = p.K, gsh = p.gs_shift;
+    const ulong kg = ulong(K >> gsh);
+    const ulong so0 = e * p.stride_s + ulong(r0) * kg, so1 = e * p.stride_s + ulong(r1) * kg;
+    const ulong kw = ulong(K >> 3);
+    const ulong wo0 = e * p.stride_w + ulong(r0) * kw, wo1 = e * p.stride_w + ulong(r1) * kw;
+
+    for (int t0 = 0; t0 < c; t0 += 4) {
+        int pr[4];
+        const device half* xm[4];
+        for (int t = 0; t < 4; ++t) {
+            pr[t] = g_pairs[base + min(t0 + t, c - 1)];
+            xm[t] = x + (pr[t] / p.top_k) * K;
+        }
+        float ag0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, ag1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float au0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, au1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 3, g = gk >> gsh;
+            const half2 hsg0 = half2(load_sb_h(sg_a, so0+g)), hbg0 = half2(load_sb_h(bg_a, so0+g));
+            const half2 hsg1 = half2(load_sb_h(sg_a, so1+g)), hbg1 = half2(load_sb_h(bg_a, so1+g));
+            const half2 hsu0 = half2(load_sb_h(su_a, so0+g)), hbu0 = half2(load_sb_h(bu_a, so0+g));
+            const half2 hsu1 = half2(load_sb_h(su_a, so1+g)), hbu1 = half2(load_sb_h(bu_a, so1+g));
+            const uint32_t g0a = wg[wo0+wi], g0b = wg[wo0+wi+1], g1a = wg[wo1+wi], g1b = wg[wo1+wi+1];
+            const uint32_t u0a = wu[wo0+wi], u0b = wu[wo0+wi+1], u1a = wu[wo1+wi], u1b = wu[wo1+wi+1];
+            for (int t = 0; t < 4; ++t) {
+                const device half4* xp = (const device half4*)(xm[t] + gk);
+                ag0[t] += dot_4bit_word(g0a, hsg0, hbg0, xp) + dot_4bit_word(g0b, hsg0, hbg0, xp + 2);
+                ag1[t] += dot_4bit_word(g1a, hsg1, hbg1, xp) + dot_4bit_word(g1b, hsg1, hbg1, xp + 2);
+                au0[t] += dot_4bit_word(u0a, hsu0, hbu0, xp) + dot_4bit_word(u0b, hsu0, hbu0, xp + 2);
+                au1[t] += dot_4bit_word(u1a, hsu1, hbu1, xp) + dot_4bit_word(u1b, hsu1, hbu1, xp + 2);
+            }
+        }
+        for (int t = 0; t < 4; ++t) {
+            if (t0 + t >= c) break;                     // seragam dalam simdgroup
+            const float gv0 = simd_sum(ag0[t]), uv0 = simd_sum(au0[t]);
+            const float gv1 = simd_sum(ag1[t]), uv1 = simd_sum(au1[t]);
+            const int o_base = pr[t] * p.N;
+            if (lane == 0) {
+                out[o_base + r0] = half((gv0 / (1.0f + exp(-gv0))) * uv0);
+                if (row0 + 1 < p.N) out[o_base + r1] = half((gv1 / (1.0f + exp(-gv1))) * uv1);
+            }
+        }
+    }
+}
+
+// Down berkelompok: grid = ((N+15)/16, E). Baris sama dengan moe_down_3d_impl (4 baris/simdgroup), ubin 4 token.
+kernel void moe_down_g4(
+    device const half* moe_h [[buffer(0)]], device const int* g_cnt [[buffer(1)]], device const int* g_off [[buffer(2)]],
+    device const int* g_pairs [[buffer(3)]],
+    device const uint32_t* wd [[buffer(4)]], device const ushort* sd [[buffer(5)]], device const ushort* bd [[buffer(6)]],
+    device half* moe_out [[buffer(7)]], constant MoEProjParams& p [[buffer(8)]],
+    uint3 tg_id [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    const int row0 = (int(tg_id.x) * 4 + int(sg)) * 4;
+    const int ei = int(tg_id.y);
+    if (row0 >= p.N) return;
+    const int c = g_cnt[ei];
+    if (c == 0) return;
+    const int base = g_off[ei];
+    const int r0 = row0, r1 = min(row0 + 1, p.N - 1), r2 = min(row0 + 2, p.N - 1), r3 = min(row0 + 3, p.N - 1);
+    const ulong e = ulong(ei);
+    const int K = p.K, gsh = p.gs_shift;
+    const ulong kg = ulong(K >> gsh);
+    const ulong so0 = e * p.stride_s + ulong(r0) * kg, so1 = e * p.stride_s + ulong(r1) * kg;
+    const ulong so2 = e * p.stride_s + ulong(r2) * kg, so3 = e * p.stride_s + ulong(r3) * kg;
+    const ulong kw = ulong(K >> 3);
+    const ulong wo0 = e * p.stride_w + ulong(r0) * kw, wo1 = e * p.stride_w + ulong(r1) * kw;
+    const ulong wo2 = e * p.stride_w + ulong(r2) * kw, wo3 = e * p.stride_w + ulong(r3) * kw;
+
+    for (int t0 = 0; t0 < c; t0 += 4) {
+        int pr[4];
+        const device half* hk[4];
+        for (int t = 0; t < 4; ++t) {
+            pr[t] = g_pairs[base + min(t0 + t, c - 1)];
+            hk[t] = moe_h + pr[t] * K;
+        }
+        float a0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, a1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float a2[4] = {0.0f, 0.0f, 0.0f, 0.0f}, a3[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 3, g = gk >> gsh;
+            const half2 hs0 = half2(load_sb_h(sd, so0+g)), hb0 = half2(load_sb_h(bd, so0+g));
+            const half2 hs1 = half2(load_sb_h(sd, so1+g)), hb1 = half2(load_sb_h(bd, so1+g));
+            const half2 hs2 = half2(load_sb_h(sd, so2+g)), hb2 = half2(load_sb_h(bd, so2+g));
+            const half2 hs3 = half2(load_sb_h(sd, so3+g)), hb3 = half2(load_sb_h(bd, so3+g));
+            const uint32_t w0a = wd[wo0+wi], w0b = wd[wo0+wi+1], w1a = wd[wo1+wi], w1b = wd[wo1+wi+1];
+            const uint32_t w2a = wd[wo2+wi], w2b = wd[wo2+wi+1], w3a = wd[wo3+wi], w3b = wd[wo3+wi+1];
+            for (int t = 0; t < 4; ++t) {
+                const device half4* xp = (const device half4*)(hk[t] + gk);
+                a0[t] += dot_4bit_word(w0a, hs0, hb0, xp) + dot_4bit_word(w0b, hs0, hb0, xp + 2);
+                a1[t] += dot_4bit_word(w1a, hs1, hb1, xp) + dot_4bit_word(w1b, hs1, hb1, xp + 2);
+                a2[t] += dot_4bit_word(w2a, hs2, hb2, xp) + dot_4bit_word(w2b, hs2, hb2, xp + 2);
+                a3[t] += dot_4bit_word(w3a, hs3, hb3, xp) + dot_4bit_word(w3b, hs3, hb3, xp + 2);
+            }
+        }
+        for (int t = 0; t < 4; ++t) {
+            if (t0 + t >= c) break;
+            const float v0 = simd_sum(a0[t]), v1 = simd_sum(a1[t]), v2 = simd_sum(a2[t]), v3 = simd_sum(a3[t]);
+            const int o_base = pr[t] * p.N;
+            if (lane == 0) {
+                moe_out[o_base + r0] = half(v0);
+                if (row0 + 1 < p.N) moe_out[o_base + r1] = half(v1);
+                if (row0 + 2 < p.N) moe_out[o_base + r2] = half(v2);
+                if (row0 + 3 < p.N) moe_out[o_base + r3] = half(v3);
+            }
+        }
+    }
+}
+
 // Fase 0: kernel kosong untuk mengukur biaya dispatch/barrier murni (dipakai hanya oleh bench_overhead)
 kernel void null_kernel() {}

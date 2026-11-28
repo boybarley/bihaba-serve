@@ -402,3 +402,13 @@ Hipotesis baru (1.7.0.dev9): bobot kita dipetakan zero-copy dari file (mmap + ne
 MLX memuat ke buffer Metal miliknya; `bw_probe` pada buffer Private baru = 322–327 GB/s ≈ lm_head MLX 328 GB/s,
 sedangkan kernel kita di atas mmap mentok ±285 GB/s. Microbench kini menyalin tensor ke buffer Private/Shared
 baru dan mengukur kernel yang sama.
+
+### 12.8 Hasil 1.7.0.dev9: bobot mmap vs buffer Metal baru — TIDAK ada beda
+lm_head private/shared 1986/1987 µs = mmap 1987 µs. Lokasi memori bukan penyebab selisih lm_head dengan MLX.
+
+### 12.9 1.7.0.dev10: expert MoE berkelompok untuk prefill (4-bit, bit-identik)
+Prefill MoE (M > 8) dulu: grid (N/8, top_k, M) → bobot expert dibaca ulang untuk setiap pasangan (token, slot).
+Kini: `moe_group` (1 TG) mengelompokkan pasangan per expert secara deterministik (urut id pasangan), lalu
+`moe_swiglu_g4` / `moe_down_g4` (grid (N/rows, E)) membaca bobot sekali per langkah K untuk ubin 4 token.
+Urutan akumulasi per (pasangan, baris) sama dengan kernel lama → bit-identik. Decode (M=1) dan verifikasi
+spekulatif (M ≤ 8) tetap jalur lama. `BIHABA_MOE_GROUP=0` → jalur lama. Bench: baris "MoE expert berkelompok".
