@@ -153,6 +153,27 @@ python3 scripts/uji_semua.py                  # every new build → one table, P
 ```
 The rules every contributor (human or AI) follows are in `docs/CATATAN_TEKNIS.md` §0.
 
+## What's new in v1.7
+Measured on the same M1 Max (64 GB) against v1.6.2 and against mlx-lm 0.32.2 (latest at the time), same models. Every class passes `scripts/uji_semua.py`, and answers are identical to the v1.6.2 baseline.
+
+| Model | Metric | v1.6.2 | **v1.7.0** | mlx-lm 0.32.2 |
+|---|---|---|---|---|
+| Bihaba-AI-1.7B (6-bit) | Prefill / decode | 1143 / 132 | **1143 / 140** | 754 / 128 |
+| Qwythos-9B (4-bit) | Prefill / decode | 276 / 46 | **276 / 52** | 184 / 55.4 |
+| Qwen3.8-27B (4-bit) | Prefill / decode | 78 / 15 | **78 / 18** | 78.4 / 18.6 |
+| 35B-A3B MoE, native top-8 | Prefill / decode | 289 / 87 | **402 / 87** | 433 / 70 |
+| 35B-A3B MoE, `--top-k 4` | Prefill / decode | 433 / 97 | **548 / 100** | – |
+
+(tok/s; prefill = 512-token prompt; mlx-lm prompts were 570–1009 tokens. 0.3B MNN: 336 → ~355 tok/s decode.)
+
+- **SwiGLU decode kernel (M=1) with scalar accumulators.** The generic kernel kept `ag[8]/au[8]` arrays indexed at runtime, which spilled to memory. 9B gate+up went from 277 µs to 200 µs, now faster than MLX's 209 µs. Bit-identical.
+- **Grouped MoE experts for prefill.** (token, slot) pairs are grouped per expert in a deterministic order, so each expert's weights are read once for up to 4 tokens instead of once per pair. Bit-identical. `BIHABA_MOE_GROUP=0` restores the old path.
+- **Prefill chunk per model class:** 512 for Qwen3.5 MoE (more tokens per expert), 128 for everything else. `--prefill-chunk` still overrides it.
+- **Per-message checkpoints** for the canonical path (API clients, edited history): the engine restores the longest matching checkpoint on the chunk grid instead of re-prefilling from scratch, with answers identical to the full prefill. The Web Console keeps the token-exact session cache as the default (TTFT ~0.3 s).
+- **Qwen3.8-27B** is a fifth test class in `uji_semua.py`, with its baseline taken from the stable version (`--repo`, `--hanya`, baselines are merged instead of overwritten).
+- **Measurement tools:** `BIHABA_BENCH_OVERHEAD=1` (dispatch/barrier cost, per-kernel-group attribution), `BIHABA_BENCH_KERNELS=1` + `scripts/bench_mlx_kernels.py` (per-tensor µs and GB/s against MLX), `BIHABA_BENCH_PREFILL=1` (prefill attribution).
+- Experiments that did not win (RMSNorm fusion, MLX-pattern qmv, MMA grouped experts, 8-token tiles, router GEMM, and others) were removed. They are documented in `docs/CATATAN_TEKNIS.md` §10–§12 so they are not retried.
+
 ## What's new in v1.6
 - **Long-context decode for dense Qwen3/Llama models:** the sequence is split across threadgroups (flash-decoding). At a 3k-token context: 0.3B goes 130 → 250 tok/s, and 1.7B goes 81 → 109 tok/s. Greedy output is identical. It is off for Qwen3.5 (small gain there); enable it with `BIHABA_ATTN_SPLIT=1024`.
 - **Context limit:** the context is capped at the model's `max_position_embeddings`, so a conversation fails with a clear message instead of degrading silently.

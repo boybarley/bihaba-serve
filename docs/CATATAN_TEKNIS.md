@@ -476,3 +476,8 @@ SwiGLU M=1 skalar, checkpoint per pesan, chunk per kelas (MoE 512), instrumen Fa
   (menyimpan satu kelas tidak menghapus acuan kelas lain).
 - Acuan kelas baru diambil dari versi STABIL bila bisa: `--simpan-acuan --hanya besar --repo ~/bihaba-serve`.
 - Detektor menerima alias `qwen3_8*` (Qwen3.8 dibangun di atas arsitektur Qwen3.5).
+
+## 13. Rilis v1.7.0 (2026-11-29)
+Naik dari bihaba-next 1.7.0.dev18 setelah `uji_semua.py` LULUS 5 kelas (jawaban identik dengan acuan v1.6.2;
+27B acuan dari versi stabil). Acuan v1.6.2 diarsipkan ke `~/bihaba-acuan-v1.6.2`; acuan baru diambil dari v1.7.0.
+Celah tersisa vs mlx-lm 0.32.2: decode dense besar (9B −5%, 27B −3–5%) dan prefill MoE top-8 (−7%).
