@@ -1815,6 +1815,78 @@ kernel void moe_router_shgate_4b(
     uint tg_x [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
 { moe_router_shgate_impl<4>(x, wr, sr, br, wg, sg_a, bg_a, out_r, out_g, p, tg_x, sg, lane); }
 
+// ─── 1.7.0.dev15: router prefill satu dispatch ───
+template <int BITS>
+inline void moe_router_shgate_blk_impl(
+    device const half*     x,
+    device const uint32_t* w_r, device const ushort* s_r, device const ushort* b_r,
+    device const uint32_t* w_g, device const ushort* s_g, device const ushort* b_g,
+    device half* out_r, device half* out_g, constant QMVMultiParams& p, const int M,
+    uint tg_x, uint sg, uint lane)
+{
+    const int K = p.K, N = p.N, gsh = p.gs_shift;
+    const int row = int(tg_x) * 4 + int(sg);
+    const ulong kg = ulong(K >> gsh);
+
+    device const uint32_t* wp; device const ushort *sp, *bp; device half* op;
+    int lr = 0, out_stride = N;
+    if (row < N)       { wp = w_r; sp = s_r; bp = b_r; op = out_r; lr = row; out_stride = N; }
+    else if (row == N) { wp = w_g; sp = s_g; bp = b_g; op = out_g; lr = 0;   out_stride = 1; }
+    else return;
+
+    const ulong so = ulong(lr) * kg;
+    float acc[8] = {0,0,0,0,0,0,0,0};
+    if (BITS == 8) {
+        const ulong wo = ulong(lr) * ulong(K >> 2);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 2, g = gk >> gsh;
+            const uint32_t w0 = wp[wo+wi], w1 = wp[wo+wi+1], w2 = wp[wo+wi+2], w3 = wp[wo+wi+3];
+            const float s = load_sb_f(sp, so + g), b = load_sb_f(bp, so + g);
+            for (int m = 0; m < M; ++m) {
+                const device half4* xp = (const device half4*)(x + m * K + gk);
+                acc[m] += dot_8bit_word(w0, s, b, xp[0]) + dot_8bit_word(w1, s, b, xp[1])
+                        + dot_8bit_word(w2, s, b, xp[2]) + dot_8bit_word(w3, s, b, xp[3]);
+            }
+        }
+    } else {
+        const ulong wo = ulong(lr) * ulong(K >> 3);
+        for (int k0 = 0; k0 < K; k0 += 512) {
+            const int gk = k0 + int(lane) * 16;
+            if (gk >= K) break;
+            const int wi = gk >> 3, g = gk >> gsh;
+            const uint32_t wvx = wp[wo+wi], wvy = wp[wo+wi+1];
+            const half2 hs = half2(load_sb_h(sp, so + g)), hb = half2(load_sb_h(bp, so + g));
+            for (int m = 0; m < M; ++m) {
+                const device half4* xp = (const device half4*)(x + m * K + gk);
+                acc[m] += dot_4bit_word(wvx, hs, hb, xp) + dot_4bit_word(wvy, hs, hb, xp + 2);
+            }
+        }
+    }
+    for (int m = 0; m < M; ++m) {
+        const float v = simd_sum(acc[m]);
+        if (lane == 0) op[m * out_stride + lr] = half(v);
+    }
+}
+
+// Prefill: SATU dispatch untuk semua blok 8 token (grid y = blok). Per token, akumulasi identik dengan
+// moe_router_shgate_{8,4}b yang dulu dipanggil 64× per layer (chunk 512) → bit-identik, tanpa 64 dispatch.
+#define DECL_ROUTER_BLK(NAME, BITS) \
+kernel void NAME(device const half* x [[buffer(0)]], \
+    device const uint32_t* wr [[buffer(1)]], device const ushort* sr [[buffer(2)]], device const ushort* br [[buffer(3)]], \
+    device const uint32_t* wg [[buffer(4)]], device const ushort* sg_a [[buffer(5)]], device const ushort* bg_a [[buffer(6)]], \
+    device half* out_r [[buffer(7)]], device half* out_g [[buffer(8)]], constant QMVMultiParams& p [[buffer(9)]], \
+    uint2 tgp [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) \
+{ \
+    const int r0 = int(tgp.y) * 8; \
+    if (r0 >= p.M) return; \
+    const int mb = min(8, p.M - r0); \
+    moe_router_shgate_blk_impl<BITS>(x + r0 * p.K, wr, sr, br, wg, sg_a, bg_a, out_r + r0 * p.N, out_g + r0, p, mb, tgp.x, sg, lane); \
+}
+DECL_ROUTER_BLK(moe_router_shgate_8b_blk, 8)
+DECL_ROUTER_BLK(moe_router_shgate_4b_blk, 4)
+
 // 7B. Register-Only 32-Lane Parallel SIMD Top-K across M tokens
 kernel void moe_topk_and_shgate(
     device const half* router_logits [[buffer(0)]], device const half* sh_gate_logit [[buffer(1)]],

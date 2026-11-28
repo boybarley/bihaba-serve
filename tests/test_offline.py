@@ -568,6 +568,15 @@ class TestCkptPoint(unittest.TestCase):
         self.assertIsNone(ckpt_point(H, H))
 
 
+class TestPrefillChunkDefault(unittest.TestCase):
+    def test_per_class(self):
+        from types import SimpleNamespace as NS
+        from bihaba_serve.daemon import default_prefill_chunk
+        self.assertEqual(default_prefill_chunk(NS(engine="qwen35", is_moe=True)), 512)
+        self.assertEqual(default_prefill_chunk(NS(engine="qwen35", is_moe=False)), 128)
+        self.assertEqual(default_prefill_chunk(NS(engine="transformer", is_moe=False)), 128)
+
+
 class TestMetalLint(unittest.TestCase):
     FILES = ["engines/transformer/kernels.metal", "engines/qwen35/kernels.metal"]
 

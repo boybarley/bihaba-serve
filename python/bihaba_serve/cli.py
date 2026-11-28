@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .align import align_model_dir
-from .daemon import EngineDaemon, ModelPool, find_engine_binary
+from .daemon import EngineDaemon, ModelPool, default_prefill_chunk, find_engine_binary
 from .detector import detect_model, scan_models_dir
 from .server import run_server
 
@@ -99,7 +99,7 @@ def main() -> None:
     p_srv.add_argument("--temp", type=float, default=0.6)
     p_srv.add_argument("--rep-penalty", type=float, default=1.0,
                        help="1.0 = mati (default). >1 merusak kode/JSON & menurunkan penerimaan spekulasi")
-    p_srv.add_argument("--prefill-chunk", type=int, default=128, help="Token per langkah prefill (qwen35 1..512, transformer 1..128; 8 = perilaku lama)")
+    p_srv.add_argument("--prefill-chunk", type=int, default=None, help="Token per langkah prefill (qwen35 1..512, transformer 1..128; 8 = perilaku lama)")
     p_srv.add_argument("--thinking", action="store_true")
     p_srv.add_argument("--system-file", default=None, help="Pre-bake system prompt into GPU RAM on startup")
     p_srv.add_argument("--load-state", default=None, help="Preload baked .tstate snapshot on startup (0ms TTFT)")
@@ -122,7 +122,7 @@ def main() -> None:
     p_chat.add_argument("--max-seq", type=int, default=16384)
     p_chat.add_argument("--temp", type=float, default=0.6)
     p_chat.add_argument("--rep-penalty", type=float, default=1.0)
-    p_chat.add_argument("--prefill-chunk", type=int, default=128)
+    p_chat.add_argument("--prefill-chunk", type=int, default=None)
     p_chat.add_argument("--thinking", action="store_true")
     p_chat.add_argument("--max-tokens", type=int, default=512)
     p_chat.add_argument("--system-file", default=None)
@@ -134,7 +134,7 @@ def main() -> None:
     p_b.add_argument("--spec", type=int, default=7)
     p_b.add_argument("--tokens", type=int, default=128)
     p_b.add_argument("--profile", action="store_true")
-    p_b.add_argument("--prefill-chunk", type=int, default=128)
+    p_b.add_argument("--prefill-chunk", type=int, default=None)
 
     p_bk = sub.add_parser("bake", help="Bake a system prompt / RAG prefix into a persistent .tstate file")
     p_bk.add_argument("--model", required=True)
@@ -171,7 +171,7 @@ def main() -> None:
         info = detect_model(args.model)
         bin_path = find_engine_binary(info.engine, repo)
         cmd = [str(bin_path), str(info.path), "--bench", str(args.tokens), "--spec", str(args.spec),
-               "--prefill-chunk", str(args.prefill_chunk)]
+               "--prefill-chunk", str(args.prefill_chunk if args.prefill_chunk is not None else default_prefill_chunk(info))]
         if args.profile:
             cmd.append("--profile")
         if args.top_k > 0:

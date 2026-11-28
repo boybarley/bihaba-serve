@@ -93,6 +93,11 @@ class StopFilter:
         return out
 
 
+def default_prefill_chunk(info) -> int:
+    """Chunk prefill default per kelas (1.7.0.dev15): qwen35 MoE 512 (expert berkelompok butuh banyak token
+    per expert: 350 → 401 tok/s di M1 Max), kelas lain 128 (tidak berubah)."""
+    return 512 if getattr(info, "engine", "") == "qwen35" and getattr(info, "is_moe", False) else 128
+
 def ckpt_point(ids: list[int], header: list[int]) -> int | None:
     """Posisi tepat SETELAH header asisten terakhir (<|im_start|>assistant\n): di titik ini riwayat kanonik
     giliran berikutnya mulai berbeda (blok <think> kosong / tokenisasi ulang jawaban)."""
@@ -131,7 +136,7 @@ class EngineDaemon:
         max_seq: int = 16384,
         load_state: str | None = None,
         default_temp: float = 0.0,
-        prefill_chunk: int = 128,
+        prefill_chunk: int | None = None,
         session_cache: bool | None = None,   # None = ikut kebijakan kelas model (SESSION_CACHE_BY_ENGINE)
     ):
         self.info = model_info
@@ -150,7 +155,7 @@ class EngineDaemon:
             "--rep-penalty", str(rep_penalty),
             "--spec", str(max_spec),
             "--max-seq", str(max_seq),
-            "--prefill-chunk", str(prefill_chunk),
+            "--prefill-chunk", str(prefill_chunk if prefill_chunk is not None else default_prefill_chunk(model_info)),
         ]
         if top_k_moe > 0:
             cmd += ["--top-k", str(top_k_moe)]

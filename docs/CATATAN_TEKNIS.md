@@ -444,3 +444,13 @@ lebih mahal dari dot skalar. Tetap opt-in mode 2, tidak direkomendasikan.
 - `BIHABA_ROUTER_GEMM=1`: router prefill (M > 8) lewat GEMM satu dispatch, bukan kernel router 8-token yang
   dipanggil 64× per layer di chunk 512 (2640 dispatch, ±5% waktu prefill). Kebijakan B (logit router bisa beda tipis).
 - Bench MoE: lama | ubin4 | MMA | ubin8 | ubin8+routerGEMM, dengan jumlah token greedy identik.
+
+### 12.15 Hasil 1.7.0.dev14 — ubin 8 dan router GEMM NEGATIF
+chunk 512 top-k 8: ubin4 401, ubin8 385, ubin8+routerGEMM 381 (greedy 0/32 — jalur router `else` curiga belum
+pernah teruji); chunk 128: ubin4 350, ubin8 313. Ubin 4 tetap terbaik (tekanan register ubin 8). Opt-in saja.
+
+### 12.16 1.7.0.dev15
+- Router prefill SATU dispatch (`moe_router_shgate_{8,4}b_blk`, grid y = blok 8 token), akumulasi per token
+  sama → bit-identik. Default aktif (`BIHABA_ROUTER_BLK=0` → 64 dispatch lama). Bench: baris "Router prefill".
+- Chunk prefill default PER KELAS (Python `default_prefill_chunk`): qwen35 MoE 512, kelas lain 128.
+  `--prefill-chunk` eksplisit tetap menang. Batas chunk berubah → jawaban MoE bisa beda tipis dari acuan (kebijakan B).

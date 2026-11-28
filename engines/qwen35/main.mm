@@ -445,6 +445,8 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_moe_group = nil, pso_moe_sw_g4 = nil, pso_moe_dn_g4 = nil;
     id<MTLComputePipelineState> pso_moe_sw_gm = nil, pso_moe_dn_gm = nil;   // 1.7.0.dev13: MMA (mode 2)
     id<MTLComputePipelineState> pso_moe_sw_g8 = nil, pso_moe_dn_g8 = nil;   // 1.7.0.dev14: ubin 8 (mode 3)
+    id<MTLComputePipelineState> pso_router_blk8 = nil, pso_router_blk4 = nil;   // 1.7.0.dev15
+    bool router_blk = true;     // env BIHABA_ROUTER_BLK=0 → 64 dispatch lama
     bool router_gemm = false;   // 1.7.0.dev14: router prefill (M > 8) lewat GEMM, bukan 64 dispatch per 8 token (kebijakan B)
     id<MTLBuffer> b_g_cnt = nil, b_g_off = nil, b_g_pairs = nil;
     int moe_group = 1;      // 0 = lama, 1 = berkelompok ubin 4, 2 = + MMA (kebijakan B), 3 = berkelompok ubin 8 (bit-identik)
@@ -1033,6 +1035,7 @@ struct Qwen35Engine {
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
         if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = std::max(0, std::min(3, atoi(gv)));
         if (const char* rv = getenv("BIHABA_ROUTER_GEMM")) router_gemm = atoi(rv) != 0;
+        if (const char* bv = getenv("BIHABA_ROUTER_BLK")) router_blk = atoi(bv) != 0;
         if (const char* qv = getenv("BIHABA_QMV4F")) qmv4f_mode = std::max(0, std::min(2, atoi(qv)));
         if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
@@ -1093,6 +1096,8 @@ struct Qwen35Engine {
         pso_moe_sw_gm  = make_pso(dev, lib, "moe_swiglu_gmma4",  false, bf);
         pso_moe_dn_gm  = make_pso(dev, lib, "moe_down_gmma4",    false, bf);
         pso_moe_sw_g8  = make_pso(dev, lib, "moe_swiglu_g8",     false, bf);
+        pso_router_blk8 = make_pso(dev, lib, "moe_router_shgate_8b_blk", false, bf);
+        pso_router_blk4 = make_pso(dev, lib, "moe_router_shgate_4b_blk", false, bf);
         pso_moe_dn_g8  = make_pso(dev, lib, "moe_down_g8",       false, bf);
         pso_moe_sw1[2] = make_pso(dev, lib, "moe_swiglu_2b",     false, bf);
         pso_moe_sw1[3] = make_pso(dev, lib, "moe_swiglu_3b",     false, bf);
@@ -1607,6 +1612,16 @@ struct Qwen35Engine {
             if (!(router_gemm && M > MAX_M) &&
                 L.router.bits == L.sh_gate.bits && (L.router.bits == 8 || L.router.bits == 4) && L.router.gs_shift == L.sh_gate.gs_shift) {
                 // kernel router hanya punya 8 akumulator token → pecah per 8 baris saat prefill
+                if (router_blk && M > MAX_M && pso_router_blk8) {   // 1.7.0.dev15: satu dispatch, grid y = blok 8 token
+                    QMVMultiParams qp{M, L.router.K, L.router.N, L.router.gs_shift};
+                    set_pso(e, (L.router.bits == 8 ? pso_router_blk8 : pso_router_blk4));
+                    [e setBuffer:b_xn offset:0 atIndex:0];
+                    [e setBuffer:L.router.w_buf  offset:L.router.w  atIndex:1]; [e setBuffer:L.router.s_buf  offset:L.router.s  atIndex:2]; [e setBuffer:L.router.b_buf  offset:L.router.b  atIndex:3];
+                    [e setBuffer:L.sh_gate.w_buf offset:L.sh_gate.w atIndex:4]; [e setBuffer:L.sh_gate.s_buf offset:L.sh_gate.s atIndex:5]; [e setBuffer:L.sh_gate.b_buf offset:L.sh_gate.b atIndex:6];
+                    [e setBuffer:b_router_l offset:0 atIndex:7]; [e setBuffer:b_sh_gl offset:0 atIndex:8];
+                    [e setBytes:&qp length:sizeof(qp) atIndex:9];
+                    [e dispatchThreadgroups:MTLSizeMake((L.router.N + 3) / 4 + 1, (M + MAX_M - 1) / MAX_M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                } else
                 for (int r0 = 0; r0 < M; r0 += MAX_M) {
                     const int mb = std::min(MAX_M, M - r0);
                     QMVMultiParams qp{mb, L.router.K, L.router.N, L.router.gs_shift};
@@ -2592,6 +2607,27 @@ int main(int argc, char** argv) {
                     }
                     eng.moe_group = saved; eng.reset_states(); eng.ram_snap = StateSnapshot{};
                     eng.router_gemm = saved_rg;
+                    {   // 1.7.0.dev15: router satu dispatch A/B (mode default)
+                        const bool sb = eng.router_blk; double rms[2]; std::vector<int32_t> rt[2];
+                        for (int v = 0; v < 2; ++v) {
+                            eng.router_blk = (v == 1); eng.moe_group = saved;
+                            double best = 1e30;
+                            for (int it = 0; it < 2; ++it) {
+                                eng.reset_states(); eng.ram_snap = StateSnapshot{};
+                                int pos = 0; int32_t o = 0;
+                                auto a = std::chrono::high_resolution_clock::now();
+                                eng.prefill_range(pp, 0, pp.size(), pos, true, false, &o, nullptr, nullptr);
+                                best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - a).count());
+                            }
+                            rms[v] = best;
+                            eng.reset_states(); eng.ram_snap = StateSnapshot{};
+                            rt[v] = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true).tokens;
+                        }
+                        eng.router_blk = sb;
+                        int sm = 0; while (sm < int(std::min(rt[0].size(), rt[1].size())) && rt[0][size_t(sm)] == rt[1][size_t(sm)]) sm++;
+                        printf("▸ Router prefill (chunk %d): 64-dispatch %.0f tok/s | satu dispatch %.0f tok/s (identik %d/%zu)\n",
+                               eng.prefill_chunk, 512000.0 / rms[0], 512000.0 / rms[1], sm, rt[0].size());
+                    }
                     int same[5] = {0, 0, 0, 0, 0};
                     for (int v = 1; v < 5; ++v)
                         while (same[v] < int(std::min(toks[0].size(), toks[v].size())) && toks[0][size_t(same[v])] == toks[v][size_t(same[v])]) same[v]++;
