@@ -426,3 +426,10 @@ MoE top-k 8, prefill 512 token: chunk 128 = 350 tok/s, chunk 512 = 403 tok/s (ke
 Qwythos chunk 512 = 285 tok/s (vs 275 di chunk 128). MLX MoE top-k 8 = 433 → masih −7%.
 dev12: `BIHABA_BENCH_PREFILL=1` → atribusi waktu PREFILL per kelompok kernel (pola Fase 0b, M = chunk),
 untuk menemukan sisa waktu prefill MoE (expert vs DeltaNet vs attention vs proyeksi).
+
+### 12.12 Atribusi prefill (dev12, chunk 512) dan 1.7.0.dev13
+MoE top-k 8: expert 58% (742 ms dari 1274 ms), proyeksi 28%, DeltaNet 10%, router 5%, barrier+drain 11%.
+Dense Qwythos: proyeksi 50%, ffn 44% (GEMM MMA sudah), DeltaNet 5%, barrier 3%.
+Expert berkelompok (dev10) masih dot skalar ±1.4 TFLOPS. dev13: `moe_swiglu_gmma4` / `moe_down_gmma4` —
+gather ≤32 pasangan per expert, mesin MMA yang sama dengan GEMM prefill (load_w_tile + MMA_ACC_TILE),
+scatter ke slot pasangan. `BIHABA_MOE_GROUP=2` (opt-in; default tetap 1 = bit-identik). Kebijakan B.

@@ -2506,5 +2506,148 @@ kernel void moe_down_g4(
     }
 }
 
+
+// ═════════════ 1.7.0.dev13: expert MoE berkelompok + MMA (prefill, 4-bit) — kebijakan B (tidak bit-identik) ═════════════
+// Per expert: ubin ≤32 pasangan (baris x di-gather) × 32 baris bobot, mesin MMA yang sama dengan qmm/swiglu GEMM.
+inline void load_x_tile_g(device const half* x, thread const int* rowi, int K, int k0, threadgroup half* Xs, uint tid) {
+    const int xm = int(tid) >> 4, xk = (int(tid) & 15) * 4;
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const int m = xm + 8 * t;
+        *((threadgroup half4*)(Xs + m * 64 + xk)) = (rowi[t] >= 0)
+            ? *((const device half4*)(x + rowi[t] * K + k0 + xk)) : half4(0.0h);
+    }
+}
+
+inline void moe_sw_store_g(simdgroup_float8x8 cg, simdgroup_float8x8 cu, int m0, threadgroup float* gbuf, threadgroup float* ubuf,
+                           device half* out, device const int* pairs, int M, int N, int n_base, uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(cg, gbuf, 8);
+    simdgroup_store(cu, ubuf, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < 2; ++q) {
+        const int idx = int(lane) * 2 + q, m = m0 + (idx >> 3), col = n_base + (idx & 7);
+        if (m < M && col < N) {
+            const float gv = gbuf[idx];
+            out[pairs[m] * N + col] = half((gv / (1.0f + exp(-gv))) * ubuf[idx]);
+        }
+    }
+}
+
+inline void moe_dn_store_g(simdgroup_float8x8 c, int m0, threadgroup float* cbuf, device half* out, device const int* pairs,
+                           int M, int N, int n_base, uint lane) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(c, cbuf, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < 2; ++q) {
+        const int idx = int(lane) * 2 + q, m = m0 + (idx >> 3), col = n_base + (idx & 7);
+        if (m < M && col < N) out[pairs[m] * N + col] = half(cbuf[idx]);
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void moe_swiglu_gmma4(
+    device const half* x [[buffer(0)]], device const int* g_cnt [[buffer(1)]], device const int* g_off [[buffer(2)]],
+    device const int* g_pairs [[buffer(3)]],
+    device const uint32_t* wg [[buffer(4)]], device const ushort* sg_a [[buffer(5)]], device const ushort* bg_a [[buffer(6)]],
+    device const uint32_t* wu [[buffer(7)]], device const ushort* su_a [[buffer(8)]], device const ushort* bu_a [[buffer(9)]],
+    device half* out [[buffer(10)]], constant MoEProjParams& p [[buffer(11)]],
+    uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup half Xs[32 * 64], Ws[32 * 72];
+    threadgroup float Cg_s[4 * 64], Cu_s[4 * 64];
+    constexpr int BK = 64, WS = 72, MT = 4;
+    const int ei = int(tgp.y);
+    const int c = g_cnt[ei];
+    if (c == 0) return;
+    const int K = p.K, N = p.N, gsh = p.gs_shift, KG = K >> gsh;
+    const int row_base = int(tgp.x) * 32;
+    if (row_base >= N) return;
+    const int base = g_off[ei];
+    const int r = min(row_base + (int(tid) >> 2), N - 1);
+    device const uint32_t* wge = wg + ulong(ei) * p.stride_w;
+    device const uint32_t* wue = wu + ulong(ei) * p.stride_w;
+    device const ushort* sge = sg_a + ulong(ei) * p.stride_s;
+    device const ushort* bge = bg_a + ulong(ei) * p.stride_s;
+    device const ushort* sue = su_a + ulong(ei) * p.stride_s;
+    device const ushort* bue = bu_a + ulong(ei) * p.stride_s;
+    const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
+    threadgroup float* gbuf = Cg_s + int(sg) * 64;
+    threadgroup float* ubuf = Cu_s + int(sg) * 64;
+    const int n_base = row_base + int(sg) * 8;
+    const int xm = int(tid) >> 4;
+    for (int t0 = 0; t0 < c; t0 += 32) {
+        const int M = min(32, c - t0);
+        device const int* pairs = g_pairs + base + t0;
+        int rowi[4];
+        for (int t = 0; t < 4; ++t) { const int m = xm + 8 * t; rowi[t] = (m < M) ? pairs[m] / p.top_k : -1; }
+        simdgroup_float8x8 g0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), g1 = g0, g2 = g0, g3 = g0;
+        simdgroup_float8x8 u0 = g0, u1 = g0, u2 = g0, u3 = g0;
+        for (int k0 = 0; k0 < K; k0 += BK) {
+            load_x_tile_g(x, rowi, K, k0, Xs, tid);
+            load_w_tile<4>(wge, sge, bge, r, K, KG, gsh, k0, Ws, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            MMA_ACC_TILE(Xs, w_sg, g0, g1, g2, g3)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            load_w_tile<4>(wue, sue, bue, r, K, KG, gsh, k0, Ws, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            MMA_ACC_TILE(Xs, w_sg, u0, u1, u2, u3)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        moe_sw_store_g(g0, u0, 0, gbuf, ubuf, out, pairs, M, N, n_base, lane);
+        if (M > 8)  moe_sw_store_g(g1, u1, 8,  gbuf, ubuf, out, pairs, M, N, n_base, lane);
+        if (M > 16) moe_sw_store_g(g2, u2, 16, gbuf, ubuf, out, pairs, M, N, n_base, lane);
+        if (M > 24) moe_sw_store_g(g3, u3, 24, gbuf, ubuf, out, pairs, M, N, n_base, lane);
+    }
+}
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void moe_down_gmma4(
+    device const half* moe_h [[buffer(0)]], device const int* g_cnt [[buffer(1)]], device const int* g_off [[buffer(2)]],
+    device const int* g_pairs [[buffer(3)]],
+    device const uint32_t* wd [[buffer(4)]], device const ushort* sd [[buffer(5)]], device const ushort* bd [[buffer(6)]],
+    device half* moe_out [[buffer(7)]], constant MoEProjParams& p [[buffer(8)]],
+    uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup half Xs[32 * 64], Ws[32 * 72];
+    threadgroup float Cs[4 * 64];
+    constexpr int BK = 64, WS = 72, MT = 4;
+    const int ei = int(tgp.y);
+    const int c = g_cnt[ei];
+    if (c == 0) return;
+    const int K = p.K, N = p.N, gsh = p.gs_shift, KG = K >> gsh;
+    const int row_base = int(tgp.x) * 32;
+    if (row_base >= N) return;
+    const int base = g_off[ei];
+    const int r = min(row_base + (int(tid) >> 2), N - 1);
+    device const uint32_t* wde = wd + ulong(ei) * p.stride_w;
+    device const ushort* sde = sd + ulong(ei) * p.stride_s;
+    device const ushort* bde = bd + ulong(ei) * p.stride_s;
+    const threadgroup half* w_sg = Ws + (int(sg) * 8) * WS;
+    threadgroup float* cbuf = Cs + int(sg) * 64;
+    const int n_base = row_base + int(sg) * 8;
+    const int xm = int(tid) >> 4;
+    for (int t0 = 0; t0 < c; t0 += 32) {
+        const int M = min(32, c - t0);
+        device const int* pairs = g_pairs + base + t0;
+        int rowi[4];
+        for (int t = 0; t < 4; ++t) { const int m = xm + 8 * t; rowi[t] = (m < M) ? pairs[m] : -1; }
+        simdgroup_float8x8 c0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f), c1 = c0, c2 = c0, c3 = c0;
+        for (int k0 = 0; k0 < K; k0 += BK) {
+            load_x_tile_g(moe_h, rowi, K, k0, Xs, tid);
+            load_w_tile<4>(wde, sde, bde, r, K, KG, gsh, k0, Ws, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            MMA_ACC_TILE(Xs, w_sg, c0, c1, c2, c3)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        moe_dn_store_g(c0, 0, cbuf, moe_out, pairs, M, N, n_base, lane);
+        if (M > 8)  moe_dn_store_g(c1, 8,  cbuf, moe_out, pairs, M, N, n_base, lane);
+        if (M > 16) moe_dn_store_g(c2, 16, cbuf, moe_out, pairs, M, N, n_base, lane);
+        if (M > 24) moe_dn_store_g(c3, 24, cbuf, moe_out, pairs, M, N, n_base, lane);
+    }
+}
+
 // Fase 0: kernel kosong untuk mengukur biaya dispatch/barrier murni (dipakai hanya oleh bench_overhead)
 kernel void null_kernel() {}

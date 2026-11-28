@@ -443,8 +443,9 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_moe_sw1[5], pso_moe_dn1[5];
     // 1.7.0.dev10: expert berkelompok untuk prefill (env BIHABA_MOE_GROUP=0 → jalur lama)
     id<MTLComputePipelineState> pso_moe_group = nil, pso_moe_sw_g4 = nil, pso_moe_dn_g4 = nil;
+    id<MTLComputePipelineState> pso_moe_sw_gm = nil, pso_moe_dn_gm = nil;   // 1.7.0.dev13: MMA (mode 2)
     id<MTLBuffer> b_g_cnt = nil, b_g_off = nil, b_g_pairs = nil;
-    bool moe_group = true;
+    int moe_group = 1;      // 0 = lama, 1 = berkelompok (bit-identik), 2 = berkelompok + MMA (kebijakan B)
 
     id<MTLBuffer> b_tok=nil, b_x=nil, b_xn=nil;
     id<MTLBuffer> b_qkv=nil, b_z=nil, b_a=nil, b_b=nil, b_dn_out=nil;
@@ -1028,7 +1029,7 @@ struct Qwen35Engine {
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
-        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = atoi(gv) != 0;
+        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = std::max(0, std::min(2, atoi(gv)));
         if (const char* qv = getenv("BIHABA_QMV4F")) qmv4f_mode = std::max(0, std::min(2, atoi(qv)));
         if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
@@ -1086,6 +1087,8 @@ struct Qwen35Engine {
         pso_moe_group  = make_pso(dev, lib, "moe_group",         false, bf);
         pso_moe_sw_g4  = make_pso(dev, lib, "moe_swiglu_g4",     false, bf);
         pso_moe_dn_g4  = make_pso(dev, lib, "moe_down_g4",       false, bf);
+        pso_moe_sw_gm  = make_pso(dev, lib, "moe_swiglu_gmma4",  false, bf);
+        pso_moe_dn_gm  = make_pso(dev, lib, "moe_down_gmma4",    false, bf);
         pso_moe_sw1[2] = make_pso(dev, lib, "moe_swiglu_2b",     false, bf);
         pso_moe_sw1[3] = make_pso(dev, lib, "moe_swiglu_3b",     false, bf);
         pso_moe_sw1[4] = make_pso(dev, lib, "moe_swiglu_4b",     false, bf);
@@ -1628,7 +1631,8 @@ struct Qwen35Engine {
             bar(e);
 
             // 1.7.0.dev10: prefill → expert berkelompok (bobot expert dibaca sekali per ≤4 token), bit-identik
-            const bool grp = moe_group && M > MAX_M && pso_moe_group && L.moe_gp.bits == 4 && L.moe_up.bits == 4
+            const bool gmma = moe_group == 2 && pso_moe_sw_gm && (L.moe_gp.K % 64) == 0 && (L.moe_dp.K % 64) == 0;
+            const bool grp = moe_group >= 1 && M > MAX_M && pso_moe_group && L.moe_gp.bits == 4 && L.moe_up.bits == 4
                              && L.moe_dp.bits == 4 && top_k <= 16 && num_experts <= 512;
             if (grp) {
                 TopKParams gp{M, num_experts, top_k};
@@ -1639,21 +1643,21 @@ struct Qwen35Engine {
                 [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(512, pso_moe_group.maxTotalThreadsPerThreadgroup), 1, 1)];
                 bar(e);
                 MoEProjParams swp{M, L.moe_gp.K, L.moe_gp.N, top_k, L.moe_gp.gs_shift, L.moe_gp.stride_w, L.moe_gp.stride_s};
-                set_pso(e, pso_moe_sw_g4);
+                set_pso(e, gmma ? pso_moe_sw_gm : pso_moe_sw_g4);
                 [e setBuffer:b_xn offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_gp.w_buf offset:L.moe_gp.w atIndex:4]; [e setBuffer:L.moe_gp.s_buf offset:L.moe_gp.s atIndex:5]; [e setBuffer:L.moe_gp.b_buf offset:L.moe_gp.b atIndex:6];
                 [e setBuffer:L.moe_up.w_buf offset:L.moe_up.w atIndex:7]; [e setBuffer:L.moe_up.s_buf offset:L.moe_up.s atIndex:8]; [e setBuffer:L.moe_up.b_buf offset:L.moe_up.b atIndex:9];
                 [e setBuffer:b_moe_h offset:0 atIndex:10]; [e setBytes:&swp length:sizeof(swp) atIndex:11];
-                [e dispatchThreadgroups:MTLSizeMake((L.moe_gp.N + 7) / 8, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(gmma ? (L.moe_gp.N + 31) / 32 : (L.moe_gp.N + 7) / 8, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 bar(e);
                 MoEProjParams dnp{M, L.moe_dp.K, L.moe_dp.N, top_k, L.moe_dp.gs_shift, L.moe_dp.stride_w, L.moe_dp.stride_s};
-                set_pso(e, pso_moe_dn_g4);
+                set_pso(e, gmma ? pso_moe_dn_gm : pso_moe_dn_g4);
                 [e setBuffer:b_moe_h offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_dp.w_buf offset:L.moe_dp.w atIndex:4]; [e setBuffer:L.moe_dp.s_buf offset:L.moe_dp.s atIndex:5]; [e setBuffer:L.moe_dp.b_buf offset:L.moe_dp.b atIndex:6];
                 [e setBuffer:b_moe_out offset:0 atIndex:7]; [e setBytes:&dnp length:sizeof(dnp) atIndex:8];
-                [e dispatchThreadgroups:MTLSizeMake((L.moe_dp.N + 15) / 16, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(gmma ? (L.moe_dp.N + 31) / 32 : (L.moe_dp.N + 15) / 16, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 bar(e);
             } else {
             // Unified High-Occupancy Low-Register 3D Contiguous-Expert MoE (M=1..8!)
@@ -2562,10 +2566,10 @@ int main(int argc, char** argv) {
 
                 // 1.7.0.dev10: expert berkelompok A/B (MoE) — waktu prefill + 32 token greedy harus identik
                 if (eng.is_moe) {
-                    const bool saved = eng.moe_group;
-                    double ms[2] = {0, 0}; std::vector<int32_t> toks[2];
-                    for (int v = 0; v < 2; ++v) {
-                        eng.moe_group = (v == 1);
+                    const int saved = eng.moe_group;
+                    double ms[3] = {0, 0, 0}; std::vector<int32_t> toks[3];
+                    for (int v = 0; v < 3; ++v) {
+                        eng.moe_group = v;
                         double best = 1e30;
                         for (int it = 0; it < 2; ++it) {
                             eng.reset_states(); eng.ram_snap = StateSnapshot{};
@@ -2579,10 +2583,12 @@ int main(int argc, char** argv) {
                         toks[v] = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true).tokens;
                     }
                     eng.moe_group = saved; eng.reset_states(); eng.ram_snap = StateSnapshot{};
-                    int same = 0;
-                    while (same < int(std::min(toks[0].size(), toks[1].size())) && toks[0][size_t(same)] == toks[1][size_t(same)]) same++;
-                    printf("▸ MoE expert berkelompok (prefill 512, topK=%d): lama %.0f tok/s | kelompok %.0f tok/s (%+.0f%%) | greedy identik %d/%zu (aktif default: %s)\n",
-                           eng.top_k, 512000.0 / ms[0], 512000.0 / ms[1], 100.0 * (ms[0] / ms[1] - 1.0), same, toks[0].size(), saved ? "ya" : "tidak");
+                    int same[3] = {0, 0, 0};
+                    for (int v = 1; v < 3; ++v)
+                        while (same[v] < int(std::min(toks[0].size(), toks[v].size())) && toks[0][size_t(same[v])] == toks[v][size_t(same[v])]) same[v]++;
+                    printf("▸ MoE expert (prefill 512, chunk %d, topK=%d): lama %.0f tok/s | kelompok %.0f tok/s (identik %d/%zu) | kelompok+MMA %.0f tok/s (identik %d/%zu) (default: mode %d)\n",
+                           eng.prefill_chunk, eng.top_k, 512000.0 / ms[0], 512000.0 / ms[1], same[1], toks[0].size(),
+                           512000.0 / ms[2], same[2], toks[0].size(), saved);
                 }
             }
 
