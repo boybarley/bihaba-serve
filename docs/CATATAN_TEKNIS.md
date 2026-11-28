@@ -461,3 +461,11 @@ dev15: router satu dispatch netral (403 vs 402, identik) — 64 dispatch dulu su
 Prefill Bench chunk aktif (128/256/512) terakhir, dan angka yang hilang kini = GAGAL (tidak lolos diam-diam).
 dev16: `moe_swiglu_g4d` / `moe_down_g4d` (mode 4): bobot didekuantisasi SEKALI per word lalu dipakai untuk
 4 token (dulu `dot_4bit_word` mengulang dekuantisasi per token). Operasi per token sama → bit-identik.
+
+### 12.18 Hasil 1.7.0.dev16 dan bersih-bersih 1.7.0.dev17
+dev16: dekuantisasi sekali netral (400 vs 402; compiler sudah menyatukan). `uji_semua` kini membaca prefill MoE
+chunk 512: 433 → 548 tok/s (top-k 4), jawaban identik.
+dev17 MENGHAPUS jalur percobaan yang tidak menang (tercatat di §10.4, §12.7–12.8, §12.13, §12.15, §12.17):
+`qmv_4b_f`/`BIHABA_QMV4F`, uji salin-bobot microbench, MoE MMA berkelompok, ubin 8, dekuantisasi sekali,
+router GEMM, router satu dispatch. Tersisa (semua teruji): expert berkelompok ubin 4 (`BIHABA_MOE_GROUP=0` → lama),
+SwiGLU M=1 skalar, checkpoint per pesan, chunk per kelas (MoE 512), instrumen Fase 0/0b, microbench, atribusi prefill.

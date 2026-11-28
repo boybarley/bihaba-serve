@@ -423,9 +423,6 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_sw4_mmaP=nil, pso_sw2_mmaP=nil, pso_dn_in4_mmaP=nil, pso_full_qkv4_mmaP=nil;
     id<MTLComputePipelineState> pso_conv1d_prefill=nil, pso_dn_prefill=nil;
     id<MTLComputePipelineState> pso_qmv1[9], pso_qmv1_add[9];
-    // 1.7.0.dev8: qmv 4-bit M=1 pola MLX. qmv4f_mode 0 = mati, 1 = lm_head saja, 2 = semua qmv 4-bit M=1 (env BIHABA_QMV4F)
-    id<MTLComputePipelineState> pso_qmv4f = nil, pso_qmv4f_add = nil;
-    int qmv4f_mode = 0;
     id<MTLComputePipelineState> pso_qmvm[9], pso_qmvm_add[9], pso_sw[9];
     id<MTLComputePipelineState> pso_sw1[9] = {nil};   // 1.7.0.dev6: SwiGLU M=1 skalar (env BIHABA_SW1=0 → kernel lama)
     bool use_sw1 = true;
@@ -443,14 +440,8 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_moe_sw1[5], pso_moe_dn1[5];
     // 1.7.0.dev10: expert berkelompok untuk prefill (env BIHABA_MOE_GROUP=0 → jalur lama)
     id<MTLComputePipelineState> pso_moe_group = nil, pso_moe_sw_g4 = nil, pso_moe_dn_g4 = nil;
-    id<MTLComputePipelineState> pso_moe_sw_gm = nil, pso_moe_dn_gm = nil;   // 1.7.0.dev13: MMA (mode 2)
-    id<MTLComputePipelineState> pso_moe_sw_g8 = nil, pso_moe_dn_g8 = nil;   // 1.7.0.dev14: ubin 8 (mode 3)
-    id<MTLComputePipelineState> pso_moe_sw_gd = nil, pso_moe_dn_gd = nil;   // 1.7.0.dev16: ubin 4 + dekuant sekali (mode 4)
-    id<MTLComputePipelineState> pso_router_blk8 = nil, pso_router_blk4 = nil;   // 1.7.0.dev15
-    bool router_blk = true;     // env BIHABA_ROUTER_BLK=0 → 64 dispatch lama
-    bool router_gemm = false;   // 1.7.0.dev14: router prefill (M > 8) lewat GEMM, bukan 64 dispatch per 8 token (kebijakan B)
     id<MTLBuffer> b_g_cnt = nil, b_g_off = nil, b_g_pairs = nil;
-    int moe_group = 1;      // 0 lama, 1 ubin 4, 2 MMA (kebijakan B), 3 ubin 8, 4 ubin 4 + dekuant sekali (bit-identik)
+    bool moe_group = true;  // expert berkelompok ubin 4 (bit-identik); env BIHABA_MOE_GROUP=0 → jalur lama
 
     id<MTLBuffer> b_tok=nil, b_x=nil, b_xn=nil;
     id<MTLBuffer> b_qkv=nil, b_z=nil, b_a=nil, b_b=nil, b_dn_out=nil;
@@ -1034,10 +1025,7 @@ struct Qwen35Engine {
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
-        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = std::max(0, std::min(4, atoi(gv)));
-        if (const char* rv = getenv("BIHABA_ROUTER_GEMM")) router_gemm = atoi(rv) != 0;
-        if (const char* bv = getenv("BIHABA_ROUTER_BLK")) router_blk = atoi(bv) != 0;
-        if (const char* qv = getenv("BIHABA_QMV4F")) qmv4f_mode = std::max(0, std::min(2, atoi(qv)));
+        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = atoi(gv) != 0;
         if (const char* sv = getenv("BIHABA_SW1")) use_sw1 = atoi(sv) != 0;
         if (const char* av = getenv("BIHABA_ATTN_SPLIT")) { const int v = atoi(av); attn_split_min = v <= 0 ? (1 << 30) : v; }
         pso_topk64        = make_pso(dev, lib, "topk_logits_64",          false, bf);
@@ -1085,7 +1073,6 @@ struct Qwen35Engine {
             int b = bvals[i];
             pso_qmv1[b]     = make_pso(dev, lib, qmv1_n[i], false, bf);
             pso_qmv1_add[b] = make_pso(dev, lib, qmv1_n[i], true,  bf);
-            if (b == 4) { pso_qmv4f = make_pso(dev, lib, "qmv_4b_f", false, bf); pso_qmv4f_add = make_pso(dev, lib, "qmv_4b_f", true, bf); }
             pso_qmvm[b]     = make_pso(dev, lib, qmvm_n[i], false, bf);
             pso_qmvm_add[b] = make_pso(dev, lib, qmvm_n[i], true,  bf);
             pso_sw[b]       = make_pso(dev, lib, sw_n[i],   false, bf);
@@ -1094,14 +1081,6 @@ struct Qwen35Engine {
         pso_moe_group  = make_pso(dev, lib, "moe_group",         false, bf);
         pso_moe_sw_g4  = make_pso(dev, lib, "moe_swiglu_g4",     false, bf);
         pso_moe_dn_g4  = make_pso(dev, lib, "moe_down_g4",       false, bf);
-        pso_moe_sw_gm  = make_pso(dev, lib, "moe_swiglu_gmma4",  false, bf);
-        pso_moe_dn_gm  = make_pso(dev, lib, "moe_down_gmma4",    false, bf);
-        pso_moe_sw_g8  = make_pso(dev, lib, "moe_swiglu_g8",     false, bf);
-        pso_moe_sw_gd  = make_pso(dev, lib, "moe_swiglu_g4d",    false, bf);
-        pso_moe_dn_gd  = make_pso(dev, lib, "moe_down_g4d",      false, bf);
-        pso_router_blk8 = make_pso(dev, lib, "moe_router_shgate_8b_blk", false, bf);
-        pso_router_blk4 = make_pso(dev, lib, "moe_router_shgate_4b_blk", false, bf);
-        pso_moe_dn_g8  = make_pso(dev, lib, "moe_down_g8",       false, bf);
         pso_moe_sw1[2] = make_pso(dev, lib, "moe_swiglu_2b",     false, bf);
         pso_moe_sw1[3] = make_pso(dev, lib, "moe_swiglu_3b",     false, bf);
         pso_moe_sw1[4] = make_pso(dev, lib, "moe_swiglu_4b",     false, bf);
@@ -1394,12 +1373,8 @@ struct Qwen35Engine {
         const NSUInteger ioff = NSUInteger(in_row) * NSUInteger(qt.K) * 2;
         const NSUInteger ooff = NSUInteger(out_row) * NSUInteger(qt.N) * 2;
         id<MTLComputePipelineState> pso; int rows_per_tg; bool multi = true;
-        NSUInteger tpg = 128;
         if (M == 1) {
             pso = add_res ? pso_qmv1_add[qt.bits] : pso_qmv1[qt.bits]; rows_per_tg = 8; multi = false;
-            if (qt.bits == 4 && pso_qmv4f && (qmv4f_mode == 2 || (qmv4f_mode == 1 && cur_head))) {
-                pso = add_res ? pso_qmv4f_add : pso_qmv4f; tpg = 64;
-            }
         } else if (M >= mma_min_m(qt.bits) && mma_ok) {
             pso = pso_mm[qt.bits][M > MAX_M ? 1 : 0][add_res ? 1 : 0];
             rows_per_tg = (M > MAX_M) ? 64 : 32;
@@ -1413,7 +1388,7 @@ struct Qwen35Engine {
         if (multi) { QMVMultiParams p{M, qt.K, qt.N, qt.gs_shift}; [e setBytes:&p length:sizeof(p) atIndex:5]; }
         else       { QMVParams p{qt.K, qt.N, qt.gs_shift};         [e setBytes:&p length:sizeof(p) atIndex:5]; }
         const NSUInteger gy = (multi && rows_per_tg == 64) ? NSUInteger((M + 31) / 32) : 1;
-        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [e dispatchThreadgroups:MTLSizeMake((qt.N + rows_per_tg - 1) / rows_per_tg, gy, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
 
     void enc_swiglu(id<MTLComputeCommandEncoder> e, int M, id<MTLBuffer> inp, const QTensor& gp, const QTensor& up, id<MTLBuffer> outp,
@@ -1612,19 +1587,8 @@ struct Qwen35Engine {
 
         if (is_moe) {
             // Wave 1 (Concurrent): Router+ShGate + Shared-Expert SwiGLU
-            if (!(router_gemm && M > MAX_M) &&
-                L.router.bits == L.sh_gate.bits && (L.router.bits == 8 || L.router.bits == 4) && L.router.gs_shift == L.sh_gate.gs_shift) {
+            if (L.router.bits == L.sh_gate.bits && (L.router.bits == 8 || L.router.bits == 4) && L.router.gs_shift == L.sh_gate.gs_shift) {
                 // kernel router hanya punya 8 akumulator token → pecah per 8 baris saat prefill
-                if (router_blk && M > MAX_M && pso_router_blk8) {   // 1.7.0.dev15: satu dispatch, grid y = blok 8 token
-                    QMVMultiParams qp{M, L.router.K, L.router.N, L.router.gs_shift};
-                    set_pso(e, (L.router.bits == 8 ? pso_router_blk8 : pso_router_blk4));
-                    [e setBuffer:b_xn offset:0 atIndex:0];
-                    [e setBuffer:L.router.w_buf  offset:L.router.w  atIndex:1]; [e setBuffer:L.router.s_buf  offset:L.router.s  atIndex:2]; [e setBuffer:L.router.b_buf  offset:L.router.b  atIndex:3];
-                    [e setBuffer:L.sh_gate.w_buf offset:L.sh_gate.w atIndex:4]; [e setBuffer:L.sh_gate.s_buf offset:L.sh_gate.s atIndex:5]; [e setBuffer:L.sh_gate.b_buf offset:L.sh_gate.b atIndex:6];
-                    [e setBuffer:b_router_l offset:0 atIndex:7]; [e setBuffer:b_sh_gl offset:0 atIndex:8];
-                    [e setBytes:&qp length:sizeof(qp) atIndex:9];
-                    [e dispatchThreadgroups:MTLSizeMake((L.router.N + 3) / 4 + 1, (M + MAX_M - 1) / MAX_M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                } else
                 for (int r0 = 0; r0 < M; r0 += MAX_M) {
                     const int mb = std::min(MAX_M, M - r0);
                     QMVMultiParams qp{mb, L.router.K, L.router.N, L.router.gs_shift};
@@ -1655,8 +1619,7 @@ struct Qwen35Engine {
             bar(e);
 
             // 1.7.0.dev10: prefill → expert berkelompok (bobot expert dibaca sekali per ≤4 token), bit-identik
-            const bool gmma = moe_group == 2 && pso_moe_sw_gm && (L.moe_gp.K % 64) == 0 && (L.moe_dp.K % 64) == 0;
-            const bool grp = moe_group >= 1 && M > MAX_M && pso_moe_group && L.moe_gp.bits == 4 && L.moe_up.bits == 4
+            const bool grp = moe_group && M > MAX_M && pso_moe_group && L.moe_gp.bits == 4 && L.moe_up.bits == 4
                              && L.moe_dp.bits == 4 && top_k <= 16 && num_experts <= 512;
             if (grp) {
                 TopKParams gp{M, num_experts, top_k};
@@ -1667,21 +1630,21 @@ struct Qwen35Engine {
                 [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(512, pso_moe_group.maxTotalThreadsPerThreadgroup), 1, 1)];
                 bar(e);
                 MoEProjParams swp{M, L.moe_gp.K, L.moe_gp.N, top_k, L.moe_gp.gs_shift, L.moe_gp.stride_w, L.moe_gp.stride_s};
-                set_pso(e, gmma ? pso_moe_sw_gm : (moe_group == 3 ? pso_moe_sw_g8 : (moe_group == 4 ? pso_moe_sw_gd : pso_moe_sw_g4)));
+                set_pso(e, pso_moe_sw_g4);
                 [e setBuffer:b_xn offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_gp.w_buf offset:L.moe_gp.w atIndex:4]; [e setBuffer:L.moe_gp.s_buf offset:L.moe_gp.s atIndex:5]; [e setBuffer:L.moe_gp.b_buf offset:L.moe_gp.b atIndex:6];
                 [e setBuffer:L.moe_up.w_buf offset:L.moe_up.w atIndex:7]; [e setBuffer:L.moe_up.s_buf offset:L.moe_up.s atIndex:8]; [e setBuffer:L.moe_up.b_buf offset:L.moe_up.b atIndex:9];
                 [e setBuffer:b_moe_h offset:0 atIndex:10]; [e setBytes:&swp length:sizeof(swp) atIndex:11];
-                [e dispatchThreadgroups:MTLSizeMake(gmma ? (L.moe_gp.N + 31) / 32 : (L.moe_gp.N + 7) / 8, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake((L.moe_gp.N + 7) / 8, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 bar(e);
                 MoEProjParams dnp{M, L.moe_dp.K, L.moe_dp.N, top_k, L.moe_dp.gs_shift, L.moe_dp.stride_w, L.moe_dp.stride_s};
-                set_pso(e, gmma ? pso_moe_dn_gm : (moe_group == 3 ? pso_moe_dn_g8 : (moe_group == 4 ? pso_moe_dn_gd : pso_moe_dn_g4)));
+                set_pso(e, pso_moe_dn_g4);
                 [e setBuffer:b_moe_h offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_dp.w_buf offset:L.moe_dp.w atIndex:4]; [e setBuffer:L.moe_dp.s_buf offset:L.moe_dp.s atIndex:5]; [e setBuffer:L.moe_dp.b_buf offset:L.moe_dp.b atIndex:6];
                 [e setBuffer:b_moe_out offset:0 atIndex:7]; [e setBytes:&dnp length:sizeof(dnp) atIndex:8];
-                [e dispatchThreadgroups:MTLSizeMake(gmma ? (L.moe_dp.N + 31) / 32 : (L.moe_dp.N + 15) / 16, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake((L.moe_dp.N + 15) / 16, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 bar(e);
             } else {
             // Unified High-Occupancy Low-Register 3D Contiguous-Expert MoE (M=1..8!)
@@ -1932,95 +1895,6 @@ struct Qwen35Engine {
             rep("deltanet out_proj", L.out_p, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dn_out, L.out_p, b_x, false); }));
         }
         rep("lm_head", lm_head, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lm_head, b_logits, false); }));
-
-        // 1.7.0.dev8: kernel qmv_4b_f (pola MLX) — waktu per tensor, selisih logit lm_head, decode A/B
-        if (pso_qmv4f && lm_head.bits == 4) {
-            const int saved = qmv4f_mode;
-            qmv4f_mode = 2;
-            printf("   -- qmv_4b_f (pola MLX):\n");
-            if (ld >= 0) { const auto& L = layers[size_t(ld)];
-                rep("ffn down (f)", L.down, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, L.down, b_x, false); })); }
-            if (la >= 0) { const auto& L = layers[size_t(la)];
-                rep("deltanet out_proj (f)", L.out_p, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dn_out, L.out_p, b_x, false); })); }
-            rep("lm_head (f)", lm_head, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lm_head, b_logits, false); }));
-            // selisih logit pada input nyata (hidden state setelah beberapa token)
-            reset_states(); qmv4f_mode = 0;
-            { int32_t t = 9707; for (int i = 0; i < 8; ++i) run_step_m(&t, 1, i, &t, true, RepRowsParams{}); }
-            std::vector<float> ref(static_cast<size_t>(vocab));
-            auto one = [&](int mode) {
-                qmv4f_mode = mode;
-                id<MTLCommandBuffer> cb = [queue commandBuffer];
-                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-                enc_qmv(e, 1, b_xn, lm_head, b_logits, false);
-                [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-            };
-            one(0); { const __fp16* lg = (const __fp16*)[b_logits contents]; for (int i = 0; i < vocab; ++i) ref[size_t(i)] = float(lg[i]); }
-            one(2);
-            { const __fp16* lg = (const __fp16*)[b_logits contents];
-              double mx = 0, mref = 0; int a0 = 0, a1 = 0;
-              for (int i = 0; i < vocab; ++i) {
-                  mx = std::max(mx, double(std::fabs(float(lg[i]) - ref[size_t(i)])));
-                  mref = std::max(mref, double(std::fabs(ref[size_t(i)])));
-                  if (ref[size_t(i)] > ref[size_t(a0)]) a0 = i;
-                  if (float(lg[i]) > float(lg[a1])) a1 = i;
-              }
-              printf("   lm_head selisih logit maks %.4f (|logit| maks %.2f) | argmax %s\n", mx, mref, a0 == a1 ? "sama" : "BEDA"); }
-            // decode A/B 128 token greedy
-            const char* nm[3] = {"lama", "lm_head f", "semua f"};
-            std::vector<int32_t> seq[3]; double tps[3] = {0, 0, 0};
-            for (int v = 0; v < 3; ++v) {
-                qmv4f_mode = v; reset_states();
-                int32_t t = 9707;
-                auto ta = std::chrono::high_resolution_clock::now();
-                for (int i = 0; i < 128; ++i) { run_step_m(&t, 1, i, &t, true, RepRowsParams{}); seq[v].push_back(t); }
-                tps[v] = 128000.0 / std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - ta).count();
-            }
-            printf("   decode A/B:");
-            for (int v = 0; v < 3; ++v) {
-                int same = 0; while (same < 128 && seq[v][size_t(same)] == seq[0][size_t(same)]) same++;
-                printf(" %s %.1f tok/s (identik %d/128)%s", nm[v], tps[v], same, v < 2 ? " |" : "\n");
-            }
-            qmv4f_mode = saved;
-        }
-
-        // 1.7.0.dev9: apakah bobot hasil mmap (newBufferWithBytesNoCopy) lebih lambat dibaca GPU daripada
-        // buffer Metal biasa? Salin tensor ke buffer Private / Shared baru lalu ukur kernel yang SAMA.
-        {
-            auto clone = [&](const QTensor& q, MTLResourceOptions opt) {
-                QTensor c = q;
-                const size_t wb = size_t(q.N) * size_t(q.K) * size_t(q.bits) / 8;
-                const size_t sb = size_t(q.N) * size_t(q.K >> q.gs_shift) * 2;
-                id<MTLBuffer> W = [dev newBufferWithLength:wb options:opt];
-                id<MTLBuffer> S = [dev newBufferWithLength:sb options:opt];
-                id<MTLBuffer> B = [dev newBufferWithLength:sb options:opt];
-                if (!W || !S || !B) return c;
-                id<MTLCommandBuffer> cb = [queue commandBuffer];
-                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-                [bl copyFromBuffer:q.w_buf sourceOffset:q.w toBuffer:W destinationOffset:0 size:wb];
-                [bl copyFromBuffer:q.s_buf sourceOffset:q.s toBuffer:S destinationOffset:0 size:sb];
-                [bl copyFromBuffer:q.b_buf sourceOffset:q.b toBuffer:B destinationOffset:0 size:sb];
-                [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
-                c.w_buf = W; c.w = 0; c.s_buf = S; c.s = 0; c.b_buf = B; c.b = 0;
-                return c;
-            };
-            printf("   -- bobot disalin ke buffer Metal baru (kernel sama, qmv_4b):\n");
-            for (int pv = 0; pv < 2; ++pv) {
-                const MTLResourceOptions opt = pv == 0 ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared;
-                const char* tag = pv == 0 ? "private" : "shared";
-                QTensor lh = clone(lm_head, opt);
-                char nm[48];
-                snprintf(nm, sizeof(nm), "lm_head (%s)", tag);
-                rep(nm, lh, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_xn, lh, b_logits, false); }));
-                if (ld >= 0) {
-                    QTensor dn = clone(layers[size_t(ld)].down, opt);
-                    snprintf(nm, sizeof(nm), "ffn down (%s)", tag);
-                    rep(nm, dn, nullptr, timeit([&](id<MTLComputeCommandEncoder> e) { enc_qmv(e, 1, b_dense_h, dn, b_x, false); }));
-                    QTensor g = clone(layers[size_t(ld)].gate, opt), u = clone(layers[size_t(ld)].up, opt);
-                    snprintf(nm, sizeof(nm), "ffn gate+up (%s)", tag);
-                    rep(nm, g, &u, timeit([&](id<MTLComputeCommandEncoder> e) { enc_swiglu(e, 1, b_xn, g, u, b_dense_h); }));
-                }
-            }
-        }
         reset_states();
     }
 
@@ -2588,14 +2462,12 @@ int main(int argc, char** argv) {
                            same == int(ref.size()) ? "" : "  (selisih awal kecil bisa karena urutan penjumlahan fp16; selisih di token 0–1 = bug)");
                 }
 
-                // 1.7.0.dev10: expert berkelompok A/B (MoE) — waktu prefill + 32 token greedy harus identik
+                // Expert berkelompok A/B (MoE): waktu prefill + 32 token greedy harus identik
                 if (eng.is_moe) {
-                    const int saved = eng.moe_group;
-                    const bool saved_rg = eng.router_gemm;
-                    // v: 0 lama | 1 ubin4 | 2 MMA | 3 ubin8 | 4 ubin4 + dekuant sekali
-                    double ms[5] = {0, 0, 0, 0, 0}; std::vector<int32_t> toks[5];
-                    for (int v = 0; v < 5; ++v) {
-                        eng.moe_group = v; eng.router_gemm = false;
+                    const bool saved = eng.moe_group;
+                    double ms[2] = {0, 0}; std::vector<int32_t> toks[2];
+                    for (int v = 0; v < 2; ++v) {
+                        eng.moe_group = (v == 1);
                         double best = 1e30;
                         for (int it = 0; it < 2; ++it) {
                             eng.reset_states(); eng.ram_snap = StateSnapshot{};
@@ -2609,39 +2481,10 @@ int main(int argc, char** argv) {
                         toks[v] = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true).tokens;
                     }
                     eng.moe_group = saved; eng.reset_states(); eng.ram_snap = StateSnapshot{};
-                    eng.router_gemm = saved_rg;
-                    {   // 1.7.0.dev15: router satu dispatch A/B (mode default)
-                        const bool sb = eng.router_blk; double rms[2]; std::vector<int32_t> rt[2];
-                        for (int v = 0; v < 2; ++v) {
-                            eng.router_blk = (v == 1); eng.moe_group = saved;
-                            double best = 1e30;
-                            for (int it = 0; it < 2; ++it) {
-                                eng.reset_states(); eng.ram_snap = StateSnapshot{};
-                                int pos = 0; int32_t o = 0;
-                                auto a = std::chrono::high_resolution_clock::now();
-                                eng.prefill_range(pp, 0, pp.size(), pos, true, false, &o, nullptr, nullptr);
-                                best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - a).count());
-                            }
-                            rms[v] = best;
-                            eng.reset_states(); eng.ram_snap = StateSnapshot{};
-                            rt[v] = generate_adaptive(eng, pp, 0, 32, 0, SamplingConfig{}, cost, false, true).tokens;
-                        }
-                        eng.router_blk = sb;
-                        int sm = 0; while (sm < int(std::min(rt[0].size(), rt[1].size())) && rt[0][size_t(sm)] == rt[1][size_t(sm)]) sm++;
-                        printf("▸ Router prefill (chunk %d): 64-dispatch %.0f tok/s | satu dispatch %.0f tok/s (identik %d/%zu)\n",
-                               eng.prefill_chunk, 512000.0 / rms[0], 512000.0 / rms[1], sm, rt[0].size());
-                    }
-                    int same[5] = {0, 0, 0, 0, 0};
-                    for (int v = 1; v < 5; ++v)
-                        while (same[v] < int(std::min(toks[0].size(), toks[v].size())) && toks[0][size_t(same[v])] == toks[v][size_t(same[v])]) same[v]++;
-                    const char* nm[5] = {"lama", "ubin4", "MMA", "ubin8", "ubin4+dekuant1x"};
-                    printf("▸ MoE expert (prefill 512, chunk %d, topK=%d):", eng.prefill_chunk, eng.top_k);
-                    for (int v = 0; v < 5; ++v) {
-                        printf(" %s %.0f", nm[v], 512000.0 / ms[v]);
-                        if (v) printf(" (=%d)", same[v]);
-                        if (v < 4) printf(" |");
-                        else printf(" tok/s (=n: token greedy identik dari 32; default mode %d)\n", saved);
-                    }
+                    int same = 0;
+                    while (same < int(std::min(toks[0].size(), toks[1].size())) && toks[0][size_t(same)] == toks[1][size_t(same)]) same++;
+                    printf("▸ MoE expert berkelompok (prefill 512, chunk %d, topK=%d): lama %.0f tok/s | kelompok %.0f tok/s (%+.0f%%) | greedy identik %d/%zu (aktif default: %s)\n",
+                           eng.prefill_chunk, eng.top_k, 512000.0 / ms[0], 512000.0 / ms[1], 100.0 * (ms[0] / ms[1] - 1.0), same, toks[0].size(), saved ? "ya" : "tidak");
                 }
             }
 
