@@ -308,8 +308,8 @@ static void check_qtensor(const char* name, int bits, int gs, int K, int N) {
 
 struct Qwen35Engine {
     static constexpr int MAX_M = 8;     // batas verifikasi spekulatif (draft ≤ 7)
-    static constexpr int MAX_P = 128;   // batas chunk prefill (GEMM: grid y = M/32 → GPU penuh terisi)
-    int prefill_chunk = MAX_P;          // --prefill-chunk (1..128); 8 = perilaku lama
+    static constexpr int MAX_P = 512;   // batas chunk prefill (1.7.0.dev11: 128 → 512; default --prefill-chunk tetap 128)
+    int prefill_chunk = 128;            // --prefill-chunk (1..512); default tetap 128; 8 = perilaku lama
     uint64_t model_fp = 0;              // sidik jari model untuk validasi .tstate
 
     std::vector<MappedFile> mapped_files;
@@ -1629,14 +1629,14 @@ struct Qwen35Engine {
 
             // 1.7.0.dev10: prefill → expert berkelompok (bobot expert dibaca sekali per ≤4 token), bit-identik
             const bool grp = moe_group && M > MAX_M && pso_moe_group && L.moe_gp.bits == 4 && L.moe_up.bits == 4
-                             && L.moe_dp.bits == 4 && M * top_k <= 1024 && top_k <= 16 && num_experts <= 512;
+                             && L.moe_dp.bits == 4 && top_k <= 16 && num_experts <= 512;
             if (grp) {
                 TopKParams gp{M, num_experts, top_k};
                 set_pso(e, pso_moe_group);
                 [e setBuffer:b_top_ids offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2];   [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBytes:&gp length:sizeof(gp) atIndex:4];
-                [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, pso_moe_group.maxTotalThreadsPerThreadgroup), 1, 1)];
+                [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(512, pso_moe_group.maxTotalThreadsPerThreadgroup), 1, 1)];
                 bar(e);
                 MoEProjParams swp{M, L.moe_gp.K, L.moe_gp.N, top_k, L.moe_gp.gs_shift, L.moe_gp.stride_w, L.moe_gp.stride_s};
                 set_pso(e, pso_moe_sw_g4);
@@ -2383,12 +2383,12 @@ int main(int argc, char** argv) {
             printf("Usage (Direct Zero-Copy ~/models/<dir> OR .taalas2 binary):\n");
             printf("  Profile: %s <model_dir> --profile [--bench 128] [--top-k 4] [--spec 7] [--max-seq 4096]\n", argv[0]);
             printf("  Daemon:  %s <model_dir> --daemon [--state <baked.tstate>] [--top-k 4] [--spec 7] [--rep-penalty 1.0]\n", argv[0]);
-            printf("  Opsi:    --prefill-chunk 128 (1..128; 8 = perilaku lama) --max-seq 4096 --temp 0\n");
+            printf("  Opsi:    --prefill-chunk 128 (1..512; 8 = perilaku lama) --max-seq 4096 --temp 0\n");
             return 1;
         }
         std::string model_path = argv[1], state_path = "";
         bool do_profile = false, daemon_mode = false, willneed = false;
-        int bench_toks = 0, override_topk = 0, max_spec = 7, req_max_seq = 4096, prefill_chunk = Qwen35Engine::MAX_P;
+        int bench_toks = 0, override_topk = 0, max_spec = 7, req_max_seq = 4096, prefill_chunk = 128;
         SamplingConfig def_sc;
         for (int i = 2; i < argc; ++i) {
             if (strcmp(argv[i], "--profile") == 0) do_profile = true;

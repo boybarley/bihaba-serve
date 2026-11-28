@@ -3,5 +3,5 @@ bihaba-serve — Zero-Dependency Native Apple Metal LLM Inference Server
 Created by Boy Barley from Bihaba (Team Pasai Aceh)
 """
 
-__version__ = "1.7.0.dev10"
+__version__ = "1.7.0.dev11"
 __author__ = "Boy Barley (Bihaba — Team Pasai Aceh)"

@@ -412,3 +412,11 @@ Kini: `moe_group` (1 TG) mengelompokkan pasangan per expert secara deterministik
 `moe_swiglu_g4` / `moe_down_g4` (grid (N/rows, E)) membaca bobot sekali per langkah K untuk ubin 4 token.
 Urutan akumulasi per (pasangan, baris) sama dengan kernel lama → bit-identik. Decode (M=1) dan verifikasi
 spekulatif (M ≤ 8) tetap jalur lama. `BIHABA_MOE_GROUP=0` → jalur lama. Bench: baris "MoE expert berkelompok".
+
+### 12.10 Hasil 1.7.0.dev10 + 1.7.0.dev11
+dev10 (LULUS, bit-identik): prefill MoE top-k 8 289 → 356 tok/s (+23%), top-k 4 433 → 475. Masih < MLX 433 (top-k 8).
+Dengan chunk 128 tiap expert rata-rata hanya ±4 token (top-8) → reuse bobot terbatas.
+dev11: `MAX_P` qwen35 128 → 512 (buffer; default `--prefill-chunk` TETAP 128 → perilaku default tidak berubah),
+`moe_group` ditulis ulang (satu thread per expert memindai pasangan berurutan, deterministik, P ≤ 512·16).
+Uji: `bench --prefill-chunk 512` untuk MoE (±16 token per expert). Chunk berbeda dapat mengubah jalur kernel untuk
+token sisa → jawaban bisa beda tipis dari acuan (kebijakan B) bila nanti dijadikan default untuk kelas MoE.

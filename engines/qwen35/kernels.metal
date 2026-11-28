@@ -2356,28 +2356,24 @@ kernel void moe_group(
     device int* g_pairs [[buffer(3)]], constant TopKParams& p [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]])
 {
-    threadgroup int ids[1024];
-    threadgroup atomic_int cnt[512];
-    threadgroup int off[512];
+    // 1.7.0.dev11: satu thread per expert memindai semua pasangan berurutan (P ≤ MAX_P·16) → deterministik,
+    // tanpa salinan id di threadgroup memory (muat untuk chunk 512 × top-k 16).
+    threadgroup int cnt[512];
     const int P = p.M * p.top_k, E = p.E;
-    for (int i = int(tid); i < E; i += int(ntg)) atomic_store_explicit(&cnt[i], 0, memory_order_relaxed);
-    for (int i = int(tid); i < P; i += int(ntg)) ids[i] = top_ids[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(tid); i < P; i += int(ntg)) atomic_fetch_add_explicit(&cnt[ids[i]], 1, memory_order_relaxed);
+    for (int ex = int(tid); ex < E; ex += int(ntg)) {
+        int c = 0;
+        for (int i = 0; i < P; ++i) c += (top_ids[i] == ex) ? 1 : 0;
+        cnt[ex] = c;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         int s = 0;
-        for (int e = 0; e < E; ++e) {
-            const int c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
-            off[e] = s; g_off[e] = s; g_cnt[e] = c; s += c;
-        }
+        for (int ex = 0; ex < E; ++ex) { const int c = cnt[ex]; g_off[ex] = s; g_cnt[ex] = c; cnt[ex] = s; s += c; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(tid); i < P; i += int(ntg)) {
-        const int e = ids[i];
-        int r = 0;
-        for (int j = 0; j < i; ++j) r += (ids[j] == e) ? 1 : 0;
-        g_pairs[off[e] + r] = i;
+    for (int ex = int(tid); ex < E; ex += int(ntg)) {
+        int w = cnt[ex];
+        for (int i = 0; i < P; ++i) if (top_ids[i] == ex) g_pairs[w++] = i;
     }
 }
 

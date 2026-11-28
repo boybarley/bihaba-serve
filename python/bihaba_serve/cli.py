@@ -99,7 +99,7 @@ def main() -> None:
     p_srv.add_argument("--temp", type=float, default=0.6)
     p_srv.add_argument("--rep-penalty", type=float, default=1.0,
                        help="1.0 = mati (default). >1 merusak kode/JSON & menurunkan penerimaan spekulasi")
-    p_srv.add_argument("--prefill-chunk", type=int, default=128, help="Token per langkah prefill (1..128; 8 = perilaku lama)")
+    p_srv.add_argument("--prefill-chunk", type=int, default=128, help="Token per langkah prefill (qwen35 1..512, transformer 1..128; 8 = perilaku lama)")
     p_srv.add_argument("--thinking", action="store_true")
     p_srv.add_argument("--system-file", default=None, help="Pre-bake system prompt into GPU RAM on startup")
     p_srv.add_argument("--load-state", default=None, help="Preload baked .tstate snapshot on startup (0ms TTFT)")
