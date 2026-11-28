@@ -37,7 +37,8 @@ ENV = dict(os.environ, BIHABA_SERVE_HOME=str(REPO), BIHABA_SHADER_DIR=str(REPO /
 
 ANGKA = {   # nama metrik → regex dari output bench (semakin besar semakin baik)
     "decode":   r"Live Decode Bench \(Greedy M=1\):.*=> ([\d.]+) tok/s",
-    "prefill":  r"Prefill Bench \(512 tok, chunk *128\):.*=> ([\d.]+) tok/s",
+    # chunk aktif = baris Prefill Bench terakhir (128 / 512 per kelas, 1.7.0.dev15)
+    "prefill":  r"Prefill Bench \(512 tok, chunk *(?:128|256|512)\):.*=> ([\d.]+) tok/s",
     "spek":     r"Live Speculative Bench.*=> ([\d.]+) tok/s",
 }
 
@@ -55,8 +56,8 @@ def bench(model: Path, extra: list[str]) -> tuple[dict, str]:
     m = re.search(r"=greedy (\d+)/(\d+)", out)
     res["greedy_ok"] = bool(m and m.group(1) == m.group(2))
     for k, rx in ANGKA.items():
-        m = re.search(rx, out)
-        res[k] = float(m.group(1)) if m else None
+        ms = re.findall(rx, out)
+        res[k] = float(ms[-1]) if ms else None
     return res, out
 
 
@@ -97,6 +98,8 @@ def main() -> int:
             lama, baru = angka_acuan.get(model.name, {}).get(k), b[k]
             if lama and baru and baru < lama * 0.95:
                 turun.append(f"{k} {lama:.0f}→{baru:.0f}")
+            elif lama and not baru:
+                turun.append(f"{k} hilang dari output")   # angka tak terbaca = GAGAL, bukan lolos diam-diam
         ok = b["prefill_ok"] and b["greedy_ok"] and not b["error"] and c is not False and not turun
         gagal += 0 if ok else 1
         baris.append((kelas, "✓" if b["prefill_ok"] else "✗", "✓" if b["greedy_ok"] else "✗",

@@ -454,3 +454,10 @@ pernah teruji); chunk 128: ubin4 350, ubin8 313. Ubin 4 tetap terbaik (tekanan r
   sama → bit-identik. Default aktif (`BIHABA_ROUTER_BLK=0` → 64 dispatch lama). Bench: baris "Router prefill".
 - Chunk prefill default PER KELAS (Python `default_prefill_chunk`): qwen35 MoE 512, kelas lain 128.
   `--prefill-chunk` eksplisit tetap menang. Batas chunk berubah → jawaban MoE bisa beda tipis dari acuan (kebijakan B).
+
+### 12.17 Hasil 1.7.0.dev15 dan 1.7.0.dev16
+dev15: router satu dispatch netral (403 vs 402, identik) — 64 dispatch dulu sudah berjalan bersamaan.
+`uji_semua` menampilkan prefill MoE "-" karena regex hanya mencari chunk 128 → diperbaiki: ambil baris
+Prefill Bench chunk aktif (128/256/512) terakhir, dan angka yang hilang kini = GAGAL (tidak lolos diam-diam).
+dev16: `moe_swiglu_g4d` / `moe_down_g4d` (mode 4): bobot didekuantisasi SEKALI per word lalu dipakai untuk
+4 token (dulu `dot_4bit_word` mengulang dekuantisasi per token). Operasi per token sama → bit-identik.

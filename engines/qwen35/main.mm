@@ -445,11 +445,12 @@ struct Qwen35Engine {
     id<MTLComputePipelineState> pso_moe_group = nil, pso_moe_sw_g4 = nil, pso_moe_dn_g4 = nil;
     id<MTLComputePipelineState> pso_moe_sw_gm = nil, pso_moe_dn_gm = nil;   // 1.7.0.dev13: MMA (mode 2)
     id<MTLComputePipelineState> pso_moe_sw_g8 = nil, pso_moe_dn_g8 = nil;   // 1.7.0.dev14: ubin 8 (mode 3)
+    id<MTLComputePipelineState> pso_moe_sw_gd = nil, pso_moe_dn_gd = nil;   // 1.7.0.dev16: ubin 4 + dekuant sekali (mode 4)
     id<MTLComputePipelineState> pso_router_blk8 = nil, pso_router_blk4 = nil;   // 1.7.0.dev15
     bool router_blk = true;     // env BIHABA_ROUTER_BLK=0 → 64 dispatch lama
     bool router_gemm = false;   // 1.7.0.dev14: router prefill (M > 8) lewat GEMM, bukan 64 dispatch per 8 token (kebijakan B)
     id<MTLBuffer> b_g_cnt = nil, b_g_off = nil, b_g_pairs = nil;
-    int moe_group = 1;      // 0 = lama, 1 = berkelompok ubin 4, 2 = + MMA (kebijakan B), 3 = berkelompok ubin 8 (bit-identik)
+    int moe_group = 1;      // 0 lama, 1 ubin 4, 2 MMA (kebijakan B), 3 ubin 8, 4 ubin 4 + dekuant sekali (bit-identik)
 
     id<MTLBuffer> b_tok=nil, b_x=nil, b_xn=nil;
     id<MTLBuffer> b_qkv=nil, b_z=nil, b_a=nil, b_b=nil, b_dn_out=nil;
@@ -1033,7 +1034,7 @@ struct Qwen35Engine {
         pso_attn_split    = make_pso(dev, lib, "attn_split_256",          false, bf);
         pso_attn_merge    = make_pso(dev, lib, "attn_merge_256_gated",    false, bf);
         if (const char* cv = getenv("BIHABA_CKPT_MB")) ckpt_budget = size_t(std::max(0, atoi(cv))) << 20;
-        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = std::max(0, std::min(3, atoi(gv)));
+        if (const char* gv = getenv("BIHABA_MOE_GROUP")) moe_group = std::max(0, std::min(4, atoi(gv)));
         if (const char* rv = getenv("BIHABA_ROUTER_GEMM")) router_gemm = atoi(rv) != 0;
         if (const char* bv = getenv("BIHABA_ROUTER_BLK")) router_blk = atoi(bv) != 0;
         if (const char* qv = getenv("BIHABA_QMV4F")) qmv4f_mode = std::max(0, std::min(2, atoi(qv)));
@@ -1096,6 +1097,8 @@ struct Qwen35Engine {
         pso_moe_sw_gm  = make_pso(dev, lib, "moe_swiglu_gmma4",  false, bf);
         pso_moe_dn_gm  = make_pso(dev, lib, "moe_down_gmma4",    false, bf);
         pso_moe_sw_g8  = make_pso(dev, lib, "moe_swiglu_g8",     false, bf);
+        pso_moe_sw_gd  = make_pso(dev, lib, "moe_swiglu_g4d",    false, bf);
+        pso_moe_dn_gd  = make_pso(dev, lib, "moe_down_g4d",      false, bf);
         pso_router_blk8 = make_pso(dev, lib, "moe_router_shgate_8b_blk", false, bf);
         pso_router_blk4 = make_pso(dev, lib, "moe_router_shgate_4b_blk", false, bf);
         pso_moe_dn_g8  = make_pso(dev, lib, "moe_down_g8",       false, bf);
@@ -1664,7 +1667,7 @@ struct Qwen35Engine {
                 [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(512, pso_moe_group.maxTotalThreadsPerThreadgroup), 1, 1)];
                 bar(e);
                 MoEProjParams swp{M, L.moe_gp.K, L.moe_gp.N, top_k, L.moe_gp.gs_shift, L.moe_gp.stride_w, L.moe_gp.stride_s};
-                set_pso(e, gmma ? pso_moe_sw_gm : (moe_group == 3 ? pso_moe_sw_g8 : pso_moe_sw_g4));
+                set_pso(e, gmma ? pso_moe_sw_gm : (moe_group == 3 ? pso_moe_sw_g8 : (moe_group == 4 ? pso_moe_sw_gd : pso_moe_sw_g4)));
                 [e setBuffer:b_xn offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_gp.w_buf offset:L.moe_gp.w atIndex:4]; [e setBuffer:L.moe_gp.s_buf offset:L.moe_gp.s atIndex:5]; [e setBuffer:L.moe_gp.b_buf offset:L.moe_gp.b atIndex:6];
@@ -1673,7 +1676,7 @@ struct Qwen35Engine {
                 [e dispatchThreadgroups:MTLSizeMake(gmma ? (L.moe_gp.N + 31) / 32 : (L.moe_gp.N + 7) / 8, num_experts, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 bar(e);
                 MoEProjParams dnp{M, L.moe_dp.K, L.moe_dp.N, top_k, L.moe_dp.gs_shift, L.moe_dp.stride_w, L.moe_dp.stride_s};
-                set_pso(e, gmma ? pso_moe_dn_gm : (moe_group == 3 ? pso_moe_dn_g8 : pso_moe_dn_g4));
+                set_pso(e, gmma ? pso_moe_dn_gm : (moe_group == 3 ? pso_moe_dn_g8 : (moe_group == 4 ? pso_moe_dn_gd : pso_moe_dn_g4)));
                 [e setBuffer:b_moe_h offset:0 atIndex:0]; [e setBuffer:b_g_cnt offset:0 atIndex:1];
                 [e setBuffer:b_g_off offset:0 atIndex:2]; [e setBuffer:b_g_pairs offset:0 atIndex:3];
                 [e setBuffer:L.moe_dp.w_buf offset:L.moe_dp.w atIndex:4]; [e setBuffer:L.moe_dp.s_buf offset:L.moe_dp.s atIndex:5]; [e setBuffer:L.moe_dp.b_buf offset:L.moe_dp.b atIndex:6];
@@ -2589,10 +2592,10 @@ int main(int argc, char** argv) {
                 if (eng.is_moe) {
                     const int saved = eng.moe_group;
                     const bool saved_rg = eng.router_gemm;
-                    // v: 0 lama | 1 ubin4 | 2 MMA | 3 ubin8 | 4 ubin8 + router GEMM
+                    // v: 0 lama | 1 ubin4 | 2 MMA | 3 ubin8 | 4 ubin4 + dekuant sekali
                     double ms[5] = {0, 0, 0, 0, 0}; std::vector<int32_t> toks[5];
                     for (int v = 0; v < 5; ++v) {
-                        eng.moe_group = v == 4 ? 3 : v; eng.router_gemm = (v == 4);
+                        eng.moe_group = v; eng.router_gemm = false;
                         double best = 1e30;
                         for (int it = 0; it < 2; ++it) {
                             eng.reset_states(); eng.ram_snap = StateSnapshot{};
@@ -2631,7 +2634,7 @@ int main(int argc, char** argv) {
                     int same[5] = {0, 0, 0, 0, 0};
                     for (int v = 1; v < 5; ++v)
                         while (same[v] < int(std::min(toks[0].size(), toks[v].size())) && toks[0][size_t(same[v])] == toks[v][size_t(same[v])]) same[v]++;
-                    const char* nm[5] = {"lama", "ubin4", "MMA", "ubin8", "ubin8+routerGEMM"};
+                    const char* nm[5] = {"lama", "ubin4", "MMA", "ubin8", "ubin4+dekuant1x"};
                     printf("▸ MoE expert (prefill 512, chunk %d, topK=%d):", eng.prefill_chunk, eng.top_k);
                     for (int v = 0; v < 5; ++v) {
                         printf(" %s %.0f", nm[v], 512000.0 / ms[v]);
