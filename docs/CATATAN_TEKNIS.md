@@ -420,3 +420,9 @@ dev11: `MAX_P` qwen35 128 → 512 (buffer; default `--prefill-chunk` TETAP 128 �
 `moe_group` ditulis ulang (satu thread per expert memindai pasangan berurutan, deterministik, P ≤ 512·16).
 Uji: `bench --prefill-chunk 512` untuk MoE (±16 token per expert). Chunk berbeda dapat mengubah jalur kernel untuk
 token sisa → jawaban bisa beda tipis dari acuan (kebijakan B) bila nanti dijadikan default untuk kelas MoE.
+
+### 12.11 Hasil 1.7.0.dev11 dan 1.7.0.dev12
+MoE top-k 8, prefill 512 token: chunk 128 = 350 tok/s, chunk 512 = 403 tok/s (kelompok +31% vs lama 306); greedy 32/32.
+Qwythos chunk 512 = 285 tok/s (vs 275 di chunk 128). MLX MoE top-k 8 = 433 → masih −7%.
+dev12: `BIHABA_BENCH_PREFILL=1` → atribusi waktu PREFILL per kelompok kernel (pola Fase 0b, M = chunk),
+untuk menemukan sisa waktu prefill MoE (expert vs DeltaNet vs attention vs proyeksi).

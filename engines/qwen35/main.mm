@@ -224,7 +224,7 @@ static int kernel_group(const char* fn) {
     if (pre("q35_qknorm_rope") || pre("tr_qknorm_rope")) return G_ROPE;
     if (pre("gqa_attention") || pre("attn_split") || pre("attn_merge")) return G_ATTN;
     if (pre("deltanet_")) return G_DN;
-    if (pre("moe_router") || pre("moe_topk")) return G_ROUTER;
+    if (pre("moe_router") || pre("moe_topk") || pre("moe_group")) return G_ROUTER;
     if (pre("moe_swiglu") || pre("moe_down")) return G_EXPERT;
     if (pre("moe_combine")) return G_COMBINE;
     return G_OTHER;
@@ -1996,6 +1996,41 @@ struct Qwen35Engine {
         reset_states();
     }
 
+    // ─── 1.7.0.dev12: atribusi waktu PREFILL per kelompok kernel (512 token, chunk = prefill_chunk) ───
+    void bench_prefill_attr() {
+        std::vector<int32_t> pp(512);
+        for (size_t i = 0; i < pp.size(); ++i) pp[i] = int32_t((i * 7919u + 13u) % uint32_t(std::min(vocab, 150000)));
+        auto run = [&](int mode) {
+            double best = 1e30;
+            for (int it = 0; it < 2; ++it) {
+                reset_states(); ovh_mode = mode;
+                int pos = 0; int32_t o = 0;
+                const auto a = std::chrono::high_resolution_clock::now();
+                prefill_range(pp, 0, pp.size(), pos, true, false, &o, nullptr, nullptr);
+                best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - a).count());
+                ovh_mode = 0;
+            }
+            reset_states();
+            return best;
+        };
+        long ng[G_N] = {0};
+        {   for (int g = 0; g < G_N; ++g) n_disp_grp[g] = 0;
+            reset_states(); ovh_count = true;
+            int pos = 0; int32_t o = 0;
+            prefill_range(pp, 0, pp.size(), pos, true, false, &o, nullptr, nullptr);
+            ovh_count = false;
+            for (int g = 0; g < G_N; ++g) ng[g] = n_disp_grp[g];
+            reset_states(); }
+        const double a = run(0), e = run(3);
+        printf("▸ Atribusi prefill [%s] (512 tok, chunk %d): total %.1f ms = %.0f tok/s | tanpa barrier %.1f ms (barrier+drain %.0f%%)\n",
+               is_moe ? "qwen35 MoE" : "qwen35 dense", prefill_chunk, a, 512000.0 / a, e, 100.0 * (a - e) / a);
+        for (int g = 0; g < G_N; ++g) {
+            if (ng[g] == 0) continue;
+            ovh_grp = g; const double f = run(4); ovh_grp = -1;
+            printf("       %-13s %5ld disp : %8.1f ms (%3.0f%%)\n", G_NAMES[g], ng[g], a - f, 100.0 * (a - f) / a);
+        }
+    }
+
     // Jalur cadangan exact untuk top-64 (dipakai hanya bila kernel menandai kemungkinan kandidat terlewat).
     void cpu_top64(int m, int32_t* ids, float* vals) const {
         const __fp16* row = (const __fp16*)[b_logits contents] + size_t(m) * size_t(vocab);
@@ -2452,6 +2487,7 @@ int main(int argc, char** argv) {
             }
 
             if (const char* kv = getenv("BIHABA_BENCH_KERNELS")) { if (atoi(kv) > 0) eng.bench_kernels(); }
+            if (const char* pv = getenv("BIHABA_BENCH_PREFILL")) { if (atoi(pv) > 0) eng.bench_prefill_attr(); }
             if (const char* ov = getenv("BIHABA_BENCH_OVERHEAD")) {   // Fase 0 (opt-in): biaya dispatch/barrier
                 if (atoi(ov) > 0) eng.bench_overhead(std::max(64, bench_toks / 2));
             }
