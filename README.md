@@ -279,4 +279,4 @@ Removes `~/.local/bin/bihaba-serve`, `~/.local/share/bihaba-serve`, `build/`, an
 ## Credits
 
 Created by **Boy Barley** from **Bihaba — Team Pasai Aceh**.
-Released under the **MIT License**.
+Released under the Apache License 2.0.
