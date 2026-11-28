@@ -433,3 +433,14 @@ Dense Qwythos: proyeksi 50%, ffn 44% (GEMM MMA sudah), DeltaNet 5%, barrier 3%.
 Expert berkelompok (dev10) masih dot skalar ±1.4 TFLOPS. dev13: `moe_swiglu_gmma4` / `moe_down_gmma4` —
 gather ≤32 pasangan per expert, mesin MMA yang sama dengan GEMM prefill (load_w_tile + MMA_ACC_TILE),
 scatter ke slot pasangan. `BIHABA_MOE_GROUP=2` (opt-in; default tetap 1 = bit-identik). Kebijakan B.
+
+### 12.13 Hasil 1.7.0.dev13 (MMA berkelompok) — NEGATIF
+chunk 128: MMA 256 tok/s (< ubin4 350), chunk 512: 373 (< 398); greedy identik 0/32 (curiga bug, tetapi karena
+lebih lambat tidak dikejar). Dengan ±4–16 token per expert, biaya dekuantisasi ke threadgroup + barrier per langkah K
+lebih mahal dari dot skalar. Tetap opt-in mode 2, tidak direkomendasikan.
+
+### 12.14 1.7.0.dev14
+- `moe_swiglu_g8` / `moe_down_g8`: ubin 8 token (mode 3, bit-identik) untuk chunk besar.
+- `BIHABA_ROUTER_GEMM=1`: router prefill (M > 8) lewat GEMM satu dispatch, bukan kernel router 8-token yang
+  dipanggil 64× per layer di chunk 512 (2640 dispatch, ±5% waktu prefill). Kebijakan B (logit router bisa beda tipis).
+- Bench MoE: lama | ubin4 | MMA | ubin8 | ubin8+routerGEMM, dengan jumlah token greedy identik.
