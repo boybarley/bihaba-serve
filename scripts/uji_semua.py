@@ -5,7 +5,7 @@ SATU perintah untuk menguji SEMUA kelas model — pengganti "test sana sini".
   python3 scripts/uji_semua.py --simpan-acuan   # sekali, di versi yang sudah dinilai baik (mis. v1.6.1)
   python3 scripts/uji_semua.py                  # setiap build baru: bandingkan dengan acuan
 
-Yang diuji per kelas model (transformer kecil, transformer menengah, qwen35 dense, qwen35 MoE):
+Yang diuji per kelas model (transformer kecil, transformer menengah, qwen35 dense, qwen35 MoE, qwen35 dense besar):
   1. tes offline                       2. bench: Prefill check & =greedy (kebenaran kernel)
   3. jawaban chat 3 giliran vs acuan    4. angka kecepatan vs acuan (turun > 5% = GAGAL)
 Hasil akhir: satu tabel + LULUS/GAGAL. Folder repo = folder tempat skrip ini berada (stabil atau eksperimen).
@@ -30,6 +30,7 @@ MODEL = [  # (kelas, folder model, argumen tambahan)
     ("transformer menengah", HOME / "models/Bihaba-AI-1.7B-Final",     []),
     ("qwen35 dense",         HOME / "models/Qwythos-9B-Claude",        []),
     ("qwen35 MoE",           HOME / "models/Bihaba-bagus-pakai",       ["--top-k", "4"]),
+    ("qwen35 dense besar",   HOME / "models/qwen3.8-27b",              []),   # Qwen3.8-27B (sejak 1.7.0.dev18)
 ]
 
 ENV = dict(os.environ, BIHABA_SERVE_HOME=str(REPO), BIHABA_SHADER_DIR=str(REPO / "build"),
@@ -72,7 +73,14 @@ def chat(model: Path, extra: list[str], mode: str, ref: Path) -> bool | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--simpan-acuan", action="store_true")
+    ap.add_argument("--hanya", default="", help="uji/simpan hanya kelas yang namanya memuat teks ini, mis. 'besar'")
+    ap.add_argument("--repo", default="", help="uji build repo lain (mis. ~/bihaba-serve = versi stabil) dengan skrip ini")
     a = ap.parse_args()
+    global REPO, ENV
+    if a.repo:
+        REPO = Path(a.repo).expanduser().resolve()
+        ENV = dict(os.environ, BIHABA_SERVE_HOME=str(REPO), BIHABA_SHADER_DIR=str(REPO / "build"),
+                   PYTHONPATH=str(REPO / "python"))
     mode = "simpan" if a.simpan_acuan else "banding"
     ACUAN.mkdir(exist_ok=True)
 
@@ -84,6 +92,8 @@ def main() -> int:
     angka_acuan = json.loads((ACUAN / "angka.json").read_text()) if (ACUAN / "angka.json").exists() else {}
     angka_baru, baris, gagal = {}, [], 0 if unit_ok else 1
     for kelas, model, extra in MODEL:
+        if a.hanya and a.hanya not in kelas:
+            continue
         if not model.exists():
             baris.append((kelas, "-", "-", "-", f"folder tidak ada: {model}", "GAGAL"))
             gagal += 1
@@ -107,8 +117,8 @@ def main() -> int:
                       ", ".join(turun) or " / ".join(f"{b[k]:.0f}" if b[k] else "-" for k in ANGKA),
                       "LULUS" if ok else "GAGAL"))
 
-    if mode == "simpan":
-        (ACUAN / "angka.json").write_text(json.dumps(angka_baru, indent=1))
+    if mode == "simpan":   # gabung: menyimpan satu kelas tidak menghapus acuan kelas lain
+        (ACUAN / "angka.json").write_text(json.dumps({**angka_acuan, **angka_baru}, indent=1))
     print("\n{:<22} {:>9} {:>8} {:>18}  {:<34} {}".format("Kelas", "Prefill", "Greedy", "Jawaban", "decode/prefill/spek (tok/s)", "Hasil"))
     for row in baris:
         print("{:<22} {:>9} {:>8} {:>18}  {:<34} {}".format(*row))

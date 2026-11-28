@@ -8,7 +8,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-QWEN35_ARCHS = {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+# Qwen3.8 dibangun di atas arsitektur Qwen3.5 (DeltaNet + gated attention); engine memvalidasi dimensinya sendiri.
+QWEN35_ARCHS = {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text",
+                "qwen3_8", "qwen3_8_moe", "qwen3_8_text", "qwen3_8_moe_text"}
 TRANSFORMER_ARCHS = {"qwen2", "qwen3", "llama", "mistral"}
 
 
@@ -39,7 +41,7 @@ def detect_model(model_path: str | Path) -> ModelInfo:
     mtype = str(tc.get("model_type") or cfg.get("model_type") or "").lower()
     archs = [a.lower() for a in cfg.get("architectures", [])]
 
-    is_q35 = (mtype in QWEN35_ARCHS) or any("qwen3_5" in a or "qwen35" in a for a in archs)
+    is_q35 = (mtype in QWEN35_ARCHS) or any("qwen3_5" in a or "qwen35" in a or "qwen3_8" in a for a in archs)
     is_tr = (mtype in TRANSFORMER_ARCHS)
 
     if is_q35:

@@ -469,3 +469,10 @@ dev17 MENGHAPUS jalur percobaan yang tidak menang (tercatat di §10.4, §12.7–
 `qmv_4b_f`/`BIHABA_QMV4F`, uji salin-bobot microbench, MoE MMA berkelompok, ubin 8, dekuantisasi sekali,
 router GEMM, router satu dispatch. Tersisa (semua teruji): expert berkelompok ubin 4 (`BIHABA_MOE_GROUP=0` → lama),
 SwiGLU M=1 skalar, checkpoint per pesan, chunk per kelas (MoE 512), instrumen Fase 0/0b, microbench, atribusi prefill.
+
+### 12.19 1.7.0.dev18: kelas uji ke-5 "qwen35 dense besar" (Qwen3.8-27B)
+- `uji_semua.py`: model `~/models/qwen3.8-27b`; `--hanya <teks>` untuk satu kelas; `--repo <path>` untuk menguji
+  build repo lain (mis. versi stabil) dengan skrip ini; `--simpan-acuan` kini MENGGABUNG ke angka.json
+  (menyimpan satu kelas tidak menghapus acuan kelas lain).
+- Acuan kelas baru diambil dari versi STABIL bila bisa: `--simpan-acuan --hanya besar --repo ~/bihaba-serve`.
+- Detektor menerima alias `qwen3_8*` (Qwen3.8 dibangun di atas arsitektur Qwen3.5).
